@@ -18,6 +18,10 @@ import pickle
 import concurrent.futures
 from tqdm import tqdm
 from PIL import Image
+import warnings
+
+warnings.filterwarnings("ignore", message=".*Flax classes are deprecated.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import torch
 from torch.utils.data import Dataset
@@ -125,7 +129,7 @@ def main():
     print(f"Loading Flax VAE: {args.vae_model}")
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(args.vae_model, from_pt=True)
     # Cast to bf16 for TPU optimization
-    vae_params = jax.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
+    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
     
     SCALE_FACTOR = 0.18215 
 
