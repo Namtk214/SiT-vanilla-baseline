@@ -22,6 +22,13 @@ from torchvision import datasets, transforms
 from diffusers.models import AutoencoderKL
 import array_record
 
+# Load HuggingFace Token from Kaggle Secrets if available 
+try:
+    from kaggle_secrets import UserSecretsClient
+    user_secrets = UserSecretsClient()
+    os.environ["HF_TOKEN"] = user_secrets.get_secret("HF_TOKEN")
+except Exception:
+    pass # Fallback to system environment variable if not on Kaggle
 
 def get_dataloader(data_dir, split, batch_size, num_workers=4):
     """Create PyTorch DataLoader for ImageNet folder structure."""
