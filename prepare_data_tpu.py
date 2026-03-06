@@ -23,6 +23,7 @@ import os
 import argparse
 import pickle
 import gc
+import csv
 import concurrent.futures
 from tqdm import tqdm
 from PIL import Image
@@ -57,6 +58,7 @@ except Exception:
 
 
 SUPPORTED_SPLITS = ("train", "val", "test")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".JPEG", ".JPG", ".PNG")
 
 
 class FastImageFolder(Dataset):
@@ -102,16 +104,111 @@ class FastImageFolder(Dataset):
             sample = self.transform(sample)
         return sample, target
 
-def get_dataloader(data_dir, split, batch_size, num_workers=4):
+
+class FlatImageDataset(Dataset):
+    def __init__(self, samples, transform=None):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        with open(path, 'rb') as f:
+            sample = Image.open(f).convert('RGB')
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample, target
+
+
+def resolve_split_dir(data_dir, split):
     split_dir_candidate = os.path.join(data_dir, split)
     if os.path.isdir(split_dir_candidate):
-        split_dir = split_dir_candidate
-    elif os.path.basename(os.path.normpath(data_dir)).lower() == split.lower() and os.path.isdir(data_dir):
+        return split_dir_candidate
+    if os.path.basename(os.path.normpath(data_dir)).lower() == split.lower() and os.path.isdir(data_dir):
         # Accept both .../CLS-LOC and .../CLS-LOC/train as --data-dir.
-        split_dir = data_dir
-        print(f"[prepare_data_tpu] Detected split directory passed directly: {split_dir}")
-    else:
-        split_dir = split_dir_candidate
+        print(f"[prepare_data_tpu] Detected split directory passed directly: {data_dir}")
+        return data_dir
+    return split_dir_candidate
+
+
+def list_image_files(directory):
+    if not os.path.isdir(directory):
+        return []
+    return sorted(
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, name)) and name.endswith(IMAGE_EXTENSIONS)
+    )
+
+
+def find_metadata_file(start_path, filename):
+    current = os.path.abspath(start_path)
+    while True:
+        candidate = os.path.join(current, filename)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def build_class_to_idx(data_dir):
+    train_dir = resolve_split_dir(data_dir, "train")
+    classes = sorted([d.name for d in os.scandir(train_dir) if d.is_dir()]) if os.path.isdir(train_dir) else []
+    if not classes:
+        raise RuntimeError(
+            "Could not build class index from the train split. "
+            f"Expected class directories under {train_dir}."
+        )
+    return {cls_name: i for i, cls_name in enumerate(classes)}
+
+
+def load_flat_split_samples(split_dir, split, data_dir):
+    image_paths = list_image_files(split_dir)
+    if not image_paths:
+        raise RuntimeError(f"No image files found in flat split directory: {split_dir}")
+
+    image_map = {os.path.splitext(os.path.basename(path))[0]: path for path in image_paths}
+    if split == "test":
+        return [(path, -1) for _, path in sorted(image_map.items())]
+
+    metadata_file = find_metadata_file(split_dir, f"LOC_{split}_solution.csv")
+    if metadata_file is None:
+        metadata_file = find_metadata_file(data_dir, f"LOC_{split}_solution.csv")
+    if metadata_file is None:
+        raise RuntimeError(
+            f"Could not find LOC_{split}_solution.csv for flat {split} split. "
+            "This file is required to recover class labels."
+        )
+
+    class_to_idx = build_class_to_idx(data_dir)
+    labels_by_image = {}
+    with open(metadata_file, newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for row in reader:
+            image_id = row["ImageId"]
+            prediction = row["PredictionString"].strip()
+            if not prediction:
+                continue
+            synset = prediction.split()[0]
+            if synset not in class_to_idx:
+                raise RuntimeError(f"Unknown synset '{synset}' found in {metadata_file}")
+            labels_by_image[image_id] = class_to_idx[synset]
+
+    missing_labels = sorted(image_id for image_id in image_map if image_id not in labels_by_image)
+    if missing_labels:
+        raise RuntimeError(
+            f"Missing labels for {len(missing_labels)} image(s) in {split_dir}. "
+            f"Example image id: {missing_labels[0]}"
+        )
+
+    return [(image_map[image_id], labels_by_image[image_id]) for image_id in sorted(image_map)]
+
+def get_dataloader(data_dir, split, batch_size, num_workers=4):
+    split_dir = resolve_split_dir(data_dir, split)
 
     transform = transforms.Compose([
         transforms.Resize(256),
@@ -120,7 +217,11 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
     print(f"Scanning directory {split_dir} (Fast parallel scan for Kaggle)...")
-    dataset = FastImageFolder(split_dir, transform=transform)
+    class_dirs = [d.name for d in os.scandir(split_dir) if d.is_dir()] if os.path.isdir(split_dir) else []
+    if class_dirs:
+        dataset = FastImageFolder(split_dir, transform=transform)
+    else:
+        dataset = FlatImageDataset(load_flat_split_samples(split_dir, split, data_dir), transform=transform)
     if len(dataset) == 0:
         raise RuntimeError(
             "No images found for encoding. "

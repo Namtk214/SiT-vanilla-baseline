@@ -3,6 +3,7 @@ import sys
 import math
 import argparse
 import pickle
+import gc
 import time
 import threading
 import queue
@@ -165,6 +166,14 @@ def maybe_run_online_encoding(args):
     return train_data_path, val_data_path
 
 
+def cleanup_after_online_encoding():
+    gc.collect()
+    try:
+        jax.clear_caches()
+    except Exception as exc:
+        log_stage(f"JAX cache cleanup skipped: {exc}")
+
+
 def get_device_setup(global_batch_size):
     num_devices = jax.device_count()
     if global_batch_size % num_devices != 0:
@@ -251,16 +260,10 @@ def split_leading_rng(device_rngs):
     return device_rngs.at[0].set(next_rng), worker_rng
 
 
-def get_training_batch(data_iterator, device_rngs, batch_size, n_patches, patch_dim):
-    if data_iterator is not None:
-        batch = next(data_iterator)
-        batch_x = jnp.array(batch[0])
-        batch_y = jnp.array(batch[1])
-        return batch_x, batch_y, device_rngs
-
-    device_rngs, mock_rng = split_leading_rng(device_rngs)
-    batch_x = jax.random.normal(mock_rng, (batch_size, n_patches, patch_dim))
-    batch_y = jax.random.randint(mock_rng, (batch_size,), 0, 1000)
+def get_training_batch(data_iterator, device_rngs):
+    batch = next(data_iterator)
+    batch_x = jnp.array(batch[0])
+    batch_y = jnp.array(batch[1])
     return batch_x, batch_y, device_rngs
 
 
@@ -889,6 +892,8 @@ def main():
         raise ValueError("--eval-batches must be greater than 0")
 
     args.data_path, args.val_data_path = maybe_run_online_encoding(args)
+    if args.online_encode is not None:
+        cleanup_after_online_encoding()
     checkpoint_manager = create_checkpoint_manager(args.ckpt_dir)
     init_wandb(args)
     logger = AsyncWandbLogger()
@@ -896,18 +901,23 @@ def main():
     model_dims, config, teacher_layer, student_layer, patch_dim, n_patches = build_model_setup(args.model)
     state, device_rngs = initialize_train_state_for_devices(config, args.learning_rate, num_devices)
 
-    data_iterator = None
     try:
         data_iterator = create_data_iterator(args.data_path, args.batch_size, is_training=True)
     except Exception as exc:
-        log_stage(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {exc}")
+        raise RuntimeError(
+            "Failed to load training ArrayRecords. "
+            "Fix the loader/dependencies before starting training."
+        ) from exc
 
     val_iterator = None
     if args.val_data_path is not None:
         try:
             val_iterator = create_data_iterator(args.val_data_path, args.batch_size, is_training=False)
         except Exception as exc:
-            log_stage(f"Failed to load validation ArrayRecord via Grain. Validation will be disabled. Error: {exc}")
+            raise RuntimeError(
+                "Failed to load validation ArrayRecords. "
+                "Fix the validation path/dependencies or disable validation by clearing --val-data-path / setting --eval-freq 0."
+            ) from exc
     elif args.eval_freq > 0:
         log_stage("Validation disabled because --val-data-path is not set.")
 
@@ -920,9 +930,6 @@ def main():
             batch_x, batch_y, device_rngs = get_training_batch(
                 data_iterator,
                 device_rngs,
-                args.batch_size,
-                n_patches,
-                patch_dim,
             )
             
             # Add early original batch_x to fid_worker real buffer (before reshape)
