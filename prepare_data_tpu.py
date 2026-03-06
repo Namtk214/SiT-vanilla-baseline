@@ -273,6 +273,18 @@ def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, v
     gc.collect()
 
 
+def run_multi_split_encoding(splits, data_dir, output_dir, batch_size=128, num_shards=1024, vae_model="stabilityai/sd-vae-ft-ema"):
+    for split in resolve_splits(splits):
+        run_encoding(
+            split=split,
+            data_dir=data_dir,
+            output_dir=output_dir,
+            batch_size=batch_size,
+            num_shards=num_shards,
+            vae_model=vae_model,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Encode ImageNet using JAX/TPU v5e-8.")
     parser.add_argument(
@@ -290,15 +302,14 @@ def main():
     args = parser.parse_args()
     splits = resolve_splits(args.split)
     print(f"[prepare_data_tpu] Encoding splits: {', '.join(splits)}")
-    for split in splits:
-        run_encoding(
-            split=split,
-            data_dir=args.data_dir,
-            output_dir=args.output_dir,
-            batch_size=args.batch_size,
-            num_shards=args.num_shards,
-            vae_model=args.vae_model,
-        )
+    run_multi_split_encoding(
+        splits=splits,
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        num_shards=args.num_shards,
+        vae_model=args.vae_model,
+    )
 
 if __name__ == "__main__":
     main()

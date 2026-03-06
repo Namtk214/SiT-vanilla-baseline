@@ -47,6 +47,7 @@ MODEL_CONFIGS = {
     "DiT-B/2": {"hidden_size": 768, "depth": 12, "num_heads": 12},
     "DiT-S/2": {"hidden_size": 384, "depth": 12, "num_heads": 6},
 }
+DEFAULT_TRAIN_DATA_PATH = "/path/to/imagenet/latents/*.ar"
 
 
 def log_stage(message):
@@ -103,15 +104,24 @@ def parse_args():
     parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps in an epoch")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--data-path", type=str, default="/path/to/imagenet/latents/*.ar", help="Path to ArrayRecords")
+    parser.add_argument("--data-path", type=str, default=DEFAULT_TRAIN_DATA_PATH, help="Path to training ArrayRecords")
+    parser.add_argument("--val-data-path", type=str, default=None, help="Path to validation ArrayRecords")
     parser.add_argument("--wandb-project", type=str, default="selfflow-jax", help="WandB Project Name")
     parser.add_argument("--log-freq", type=int, default=20, help="Log step metrics every N steps")
+    parser.add_argument("--eval-freq", type=int, default=500, help="Evaluate validation loss every N steps (0 disables)")
+    parser.add_argument("--eval-batches", type=int, default=4, help="Number of validation batches to average per evaluation")
     parser.add_argument("--sample-freq", type=int, default=1000, help="Generate and decode samples every M steps")
     parser.add_argument("--fid-freq", type=int, default=10000, help="Generate and evaluate FID every N steps")
     parser.add_argument("--num-fid-samples", type=int, default=4000, help="Number of samples for FID")
     parser.add_argument("--model", type=str, default="DiT-XL/2", choices=sorted(MODEL_CONFIGS), help="Model architecture")
     parser.add_argument("--online-encode", type=str, default=None, help="Path to raw ImageNet data to trigger auto TPU VAE encoding before training")
     parser.add_argument("--online-batch-size", type=int, default=128, help="Batch size for online VAE encoding")
+    parser.add_argument(
+        "--online-encode-splits",
+        nargs="+",
+        default=["train", "val"],
+        help="Splits to encode when --online-encode is enabled. Examples: train, train val, all",
+    )
     return parser.parse_args()
 
 
@@ -127,22 +137,32 @@ def create_checkpoint_manager(ckpt_dir):
 
 def maybe_run_online_encoding(args):
     if args.online_encode is None:
-        return args.data_path
+        return args.data_path, args.val_data_path
 
-    from prepare_data_tpu import run_encoding
+    from prepare_data_tpu import resolve_splits, run_multi_split_encoding
 
     log_stage(f"Online Encode requested. Source data: {args.online_encode}")
     ar_output_dir = "/kaggle/working/latents"
-    run_encoding(
-        split="train",
+    splits = resolve_splits(args.online_encode_splits)
+    if "train" not in splits and args.data_path == DEFAULT_TRAIN_DATA_PATH:
+        raise ValueError("Online encoding must include the train split unless --data-path points to existing training ArrayRecords.")
+    run_multi_split_encoding(
+        splits=splits,
         data_dir=args.online_encode,
         output_dir=ar_output_dir,
         batch_size=args.online_batch_size,
         num_shards=1024,
     )
-    data_path = f"{ar_output_dir}/*.ar"
-    log_stage(f"Online Encoding completed successfully. Using data path: {data_path}")
-    return data_path
+    train_data_path = args.data_path
+    val_data_path = args.val_data_path
+    if "train" in splits:
+        train_data_path = f"{ar_output_dir}/train-*.ar"
+    if "val" in splits:
+        val_data_path = f"{ar_output_dir}/val-*.ar"
+    log_stage(f"Online Encoding completed successfully. Train path: {train_data_path}")
+    if val_data_path is not None:
+        log_stage(f"Validation path: {val_data_path}")
+    return train_data_path, val_data_path
 
 
 def get_device_setup(global_batch_size):
@@ -188,10 +208,11 @@ def initialize_train_state_for_devices(config, learning_rate, num_devices):
     return state, device_rngs
 
 
-def create_data_iterator(data_path, batch_size):
-    log_stage(f"Initializing Grain dataloader with pattern: {data_path}")
-    dataloader = get_arrayrecord_dataloader(data_pattern=data_path, batch_size=batch_size, is_training=True)
-    log_stage("DataLoader initialized successfully via Grain.")
+def create_data_iterator(data_path, batch_size, is_training=True):
+    mode = "training" if is_training else "validation"
+    log_stage(f"Initializing {mode} dataloader with pattern: {data_path}")
+    dataloader = get_arrayrecord_dataloader(data_pattern=data_path, batch_size=batch_size, is_training=is_training)
+    log_stage(f"{mode.capitalize()} dataloader initialized successfully via Grain.")
     return iter(dataloader)
 
 
@@ -243,6 +264,16 @@ def get_training_batch(data_iterator, device_rngs, batch_size, n_patches, patch_
     return batch_x, batch_y, device_rngs
 
 
+def next_iterator_batch(data_iterator, iterator_factory):
+    try:
+        batch = next(data_iterator)
+        return batch, data_iterator
+    except StopIteration:
+        data_iterator = iterator_factory()
+        batch = next(data_iterator)
+        return batch, data_iterator
+
+
 def distribute_batch(batch_x, batch_y, num_devices, local_batch_size, n_patches, patch_dim):
     batch_x_dist = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
     batch_y_dist = batch_y.reshape(num_devices, local_batch_size)
@@ -251,6 +282,12 @@ def distribute_batch(batch_x, batch_y, num_devices, local_batch_size, n_patches,
 
 def extract_leading_replica(tree):
     return jax.tree_util.tree_map(lambda value: value[0], tree)
+
+
+def metrics_to_host_floats(metrics):
+    metrics = extract_leading_replica(metrics)
+    metrics = jax.device_get(metrics)
+    return jax.tree_util.tree_map(lambda value: float(value), metrics)
 
 
 def maybe_log_metrics(logger, metrics, global_step, last_log_time, log_freq):
@@ -263,6 +300,56 @@ def maybe_log_metrics(logger, metrics, global_step, last_log_time, log_freq):
     cpu_metrics["train/step"] = global_step
     logger.log(cpu_metrics, step=global_step)
     return now
+
+
+def maybe_run_validation(
+    args,
+    logger,
+    state,
+    val_iterator,
+    device_rngs,
+    global_step,
+    teacher_layer,
+    student_layer,
+    num_devices,
+    local_batch_size,
+    n_patches,
+    patch_dim,
+):
+    if val_iterator is None or args.eval_freq <= 0 or global_step % args.eval_freq != 0:
+        return val_iterator, device_rngs
+
+    log_stage(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
+    metric_sums = {}
+    iterator_factory = lambda: create_data_iterator(args.val_data_path, args.batch_size, is_training=False)
+
+    for _ in range(args.eval_batches):
+        batch, val_iterator = next_iterator_batch(val_iterator, iterator_factory)
+        batch_x = jnp.array(batch[0])
+        batch_y = jnp.array(batch[1])
+        batch_x_dist, batch_y_dist = distribute_batch(
+            batch_x,
+            batch_y,
+            num_devices,
+            local_batch_size,
+            n_patches,
+            patch_dim,
+        )
+        metrics, device_rngs = eval_step(
+            state,
+            (batch_x_dist, batch_y_dist),
+            device_rngs,
+            teacher_layer,
+            student_layer,
+        )
+        host_metrics = metrics_to_host_floats(metrics)
+        for key, value in host_metrics.items():
+            metric_sums[key] = metric_sums.get(key, 0.0) + value
+
+    averaged_metrics = {key: value / args.eval_batches for key, value in metric_sums.items()}
+    averaged_metrics["train/step"] = global_step
+    logger.log(averaged_metrics, step=global_step)
+    return val_iterator, device_rngs
 
 
 def decode_and_log_samples(vae, latents_dev, classes, target_step):
@@ -424,89 +511,85 @@ def create_train_state(rng, config, learning_rate):
     )
 
 
-@functools.partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(3, 4))
-def train_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, mask_ratio=0.25):
-    """Executes a single distributed training step with Self-Flow."""
+def make_self_flow_loss_fn(state, batch, rng, teacher_layer, student_layer, gamma=0.8, mask_ratio=0.25, deterministic=False):
     x, y = batch
-    
     rng, _, t_rng, s_rng, noise_rng, drop_rng, mask_rng = jax.random.split(rng, 7)
-    
-    # 1. Self-Flow: Dual-Timestep Scheduling
-    batch_size, n_patches, patch_dim = x.shape
-    
-    # Draw independent scalars t and s
+
+    batch_size, n_patches, _ = x.shape
     t = jax.random.uniform(t_rng, shape=(batch_size,))
     s = jax.random.uniform(s_rng, shape=(batch_size,))
     noise = jax.random.normal(noise_rng, x.shape, dtype=x.dtype)
-    
-    # Generate Boolean masks for tokens
+
     rand_mask = jax.random.uniform(mask_rng, shape=(batch_size, n_patches))
-    M = rand_mask < mask_ratio
-    
-    # Create per-token timestep vector tau
+    token_mask = rand_mask < mask_ratio
+
     t_expanded = jnp.broadcast_to(t[:, None], (batch_size, n_patches))
     s_expanded = jnp.broadcast_to(s[:, None], (batch_size, n_patches))
-    tau = jnp.where(M, s_expanded, t_expanded) # tokens inside M get s, outside get t
-    
-    # 2. Student Forward Pass (x_tau)
-    # x_t = (1 - t)x + t * noise --> matches velocity target (noise - x)
-    tau_expanded_input = tau[:, :, None]
-    x_tau = (1.0 - tau_expanded_input) * x + tau_expanded_input * noise 
-    target = noise - x # Standard target for flow matching
+    tau = jnp.where(token_mask, s_expanded, t_expanded)
 
-    # 3. Teacher Forward Pass (x_tau_min)
-    tau_min = jnp.minimum(t, s) # scalar condition
+    tau_expanded_input = tau[:, :, None]
+    x_tau = (1.0 - tau_expanded_input) * x + tau_expanded_input * noise
+    target = noise - x
+
+    tau_min = jnp.minimum(t, s)
     tau_min_expanded_input = tau_min[:, None, None]
     x_tau_min = (1.0 - tau_min_expanded_input) * x + tau_min_expanded_input * noise
-    
-    # Extract Teacher Features
+
     _, teacher_features = state.apply_fn(
         {'params': state.ema_params},
         x_tau_min,
-        timesteps=tau_min, # Teacher uses scalar timestep
+        timesteps=tau_min,
         vector=y,
         return_features=teacher_layer,
-        deterministic=True
+        deterministic=True,
     )
     teacher_features = jax.lax.stop_gradient(teacher_features)
 
     def loss_fn(params):
-        # Predict Student Velocity and Extract Features
+        student_kwargs = {}
+        if not deterministic:
+            student_kwargs["rngs"] = {'dropout': drop_rng}
+
         pred_velocity, student_features = state.apply_fn(
             {'params': params},
             x_tau,
-            timesteps=tau, # Student uses per-token timestep vector
+            timesteps=tau,
             vector=y,
             return_features=student_layer,
-            deterministic=False,
-            rngs={'dropout': drop_rng}
+            deterministic=deterministic,
+            **student_kwargs,
         )
-        
-        # A. Flow Loss (velocity prediction against target)
-        loss_flow_sq = (pred_velocity - target) ** 2
-        loss_flow = jnp.mean(loss_flow_sq)
-        
-        # B. Representation Alignment Loss (Cosine Similarity)
-        # Convert to float32 to prevent instabilities during normalization and sum reduction
+
+        loss_flow = jnp.mean((pred_velocity - target) ** 2)
+
         student_feat_fp32 = student_features.astype(jnp.float32)
         teacher_feat_fp32 = teacher_features.astype(jnp.float32)
-        
         student_norm = student_feat_fp32 / (jnp.linalg.norm(student_feat_fp32, axis=-1, keepdims=True) + 1e-6)
         teacher_norm = teacher_feat_fp32 / (jnp.linalg.norm(teacher_feat_fp32, axis=-1, keepdims=True) + 1e-6)
-        
-        # Cosine similarity: sum(A_norm * B_norm, axis=-1) -> mean over batch/sequence
         cos_sim = jnp.sum(student_norm * teacher_norm, axis=-1)
         loss_distill = jnp.mean(1.0 - cos_sim)
-        
-        # C. Total Loss
+
         loss = loss_flow + gamma * loss_distill
-        
-        # Internal Metrics calculation to avoid host transfers
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred_velocity))
-        
         return loss, (loss_flow, loss_distill, v_abs_mean, v_pred_abs_mean)
-        
+
+    return loss_fn, rng
+
+
+@functools.partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(3, 4))
+def train_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, mask_ratio=0.25):
+    """Executes a single distributed training step with Self-Flow."""
+    loss_fn, rng = make_self_flow_loss_fn(
+        state,
+        batch,
+        rng,
+        teacher_layer,
+        student_layer,
+        gamma=gamma,
+        mask_ratio=mask_ratio,
+        deterministic=False,
+    )
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
     (loss, (loss_flow, loss_distill, v_abs, v_pred)), grads = grad_fn(state.params)
     
@@ -545,6 +628,36 @@ def train_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, 
     }
     
     return state, metrics, rng
+
+
+@functools.partial(jax.pmap, axis_name="batch", static_broadcasted_argnums=(3, 4))
+def eval_step(state, batch, rng, teacher_layer=20, student_layer=8, gamma=0.8, mask_ratio=0.25):
+    loss_fn, rng = make_self_flow_loss_fn(
+        state,
+        batch,
+        rng,
+        teacher_layer,
+        student_layer,
+        gamma=gamma,
+        mask_ratio=mask_ratio,
+        deterministic=True,
+    )
+    loss, (loss_flow, loss_distill, v_abs, v_pred) = loss_fn(state.params)
+
+    loss = jax.lax.pmean(loss, axis_name='batch')
+    loss_flow = jax.lax.pmean(loss_flow, axis_name='batch')
+    loss_distill = jax.lax.pmean(loss_distill, axis_name='batch')
+    v_abs = jax.lax.pmean(v_abs, axis_name='batch')
+    v_pred = jax.lax.pmean(v_pred, axis_name='batch')
+
+    metrics = {
+        "val/loss_total": loss,
+        "val/loss_flow": loss_flow,
+        "val/loss_distill": loss_distill,
+        "val/v_abs_mean": v_abs,
+        "val/v_pred_abs_mean": v_pred,
+    }
+    return metrics, rng
 
 
 def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=42):
@@ -772,8 +885,10 @@ def main():
     log_stage("--- Self-Flow Training Script Starting ---")
     args = parse_args()
     log_stage(f"Arguments parsed. PID={os.getpid()} Python={sys.version.split()[0]}")
+    if args.eval_batches <= 0:
+        raise ValueError("--eval-batches must be greater than 0")
 
-    args.data_path = maybe_run_online_encoding(args)
+    args.data_path, args.val_data_path = maybe_run_online_encoding(args)
     checkpoint_manager = create_checkpoint_manager(args.ckpt_dir)
     init_wandb(args)
     logger = AsyncWandbLogger()
@@ -783,9 +898,18 @@ def main():
 
     data_iterator = None
     try:
-        data_iterator = create_data_iterator(args.data_path, args.batch_size)
+        data_iterator = create_data_iterator(args.data_path, args.batch_size, is_training=True)
     except Exception as exc:
         log_stage(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {exc}")
+
+    val_iterator = None
+    if args.val_data_path is not None:
+        try:
+            val_iterator = create_data_iterator(args.val_data_path, args.batch_size, is_training=False)
+        except Exception as exc:
+            log_stage(f"Failed to load validation ArrayRecord via Grain. Validation will be disabled. Error: {exc}")
+    elif args.eval_freq > 0:
+        log_stage("Validation disabled because --val-data-path is not set.")
 
     vae, fid_worker = maybe_initialize_host_eval(args)
     global_step = 0
@@ -825,6 +949,20 @@ def main():
             global_step += 1
             
             last_log_time = maybe_log_metrics(logger, metrics, global_step, last_log_time, args.log_freq)
+            val_iterator, device_rngs = maybe_run_validation(
+                args,
+                logger,
+                state,
+                val_iterator,
+                device_rngs,
+                global_step,
+                teacher_layer,
+                student_layer,
+                num_devices,
+                local_batch_size,
+                n_patches,
+                patch_dim,
+            )
             device_rngs = maybe_generate_samples(args, vae, state, device_rngs, global_step, model_dims)
             device_rngs = maybe_schedule_fid(args, fid_worker, state, device_rngs, global_step, model_dims)
 
