@@ -7,9 +7,7 @@ import time
 import threading
 import queue
 import functools
-import subprocess
 import faulthandler
-from collections import deque
 from pathlib import Path
 
 faulthandler.enable(all_threads=True)
@@ -131,40 +129,17 @@ def maybe_run_online_encoding(args):
     if args.online_encode is None:
         return args.data_path
 
+    from prepare_data_tpu import run_encoding
+
     log_stage(f"Online Encode requested. Source data: {args.online_encode}")
     ar_output_dir = "/kaggle/working/latents"
-    os.makedirs(ar_output_dir, exist_ok=True)
-    encoder_script = Path(__file__).resolve().parent / "prepare_data_tpu.py"
-    cmd = [
-        sys.executable, "-u", str(encoder_script),
-        "--split", "train",
-        "--data-dir", args.online_encode,
-        "--output-dir", ar_output_dir,
-        "--batch-size", str(args.online_batch_size),
-        "--num-shards", "1024",
-    ]
-    log_stage(f"Executing: {' '.join(cmd)}")
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+    run_encoding(
+        split="train",
+        data_dir=args.online_encode,
+        output_dir=ar_output_dir,
+        batch_size=args.online_batch_size,
+        num_shards=1024,
     )
-    recent_encoder_logs = deque(maxlen=40)
-    for line in process.stdout:
-        line = line.rstrip("\n")
-        recent_encoder_logs.append(line)
-        print(f"[Encoder]: {line}", flush=True)
-    process.wait()
-    if process.returncode != 0:
-        last_logs = "\n".join(recent_encoder_logs) if recent_encoder_logs else "(no encoder output captured)"
-        raise RuntimeError(
-            f"Online encoding failed with return code {process.returncode}.\n"
-            f"Last encoder logs:\n{last_logs}"
-        )
-
     data_path = f"{ar_output_dir}/*.ar"
     log_stage(f"Online Encoding completed successfully. Using data path: {data_path}")
     return data_path
@@ -798,8 +773,8 @@ def main():
     args = parse_args()
     log_stage(f"Arguments parsed. PID={os.getpid()} Python={sys.version.split()[0]}")
 
-    checkpoint_manager = create_checkpoint_manager(args.ckpt_dir)
     args.data_path = maybe_run_online_encoding(args)
+    checkpoint_manager = create_checkpoint_manager(args.ckpt_dir)
     init_wandb(args)
     logger = AsyncWandbLogger()
     num_devices, local_batch_size = get_device_setup(args.batch_size)

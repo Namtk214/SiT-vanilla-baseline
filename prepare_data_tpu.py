@@ -15,6 +15,7 @@ Usage:
 import os
 import argparse
 import pickle
+import gc
 import concurrent.futures
 from tqdm import tqdm
 from PIL import Image
@@ -129,18 +130,7 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
     return dataloader, len(dataset)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Encode ImageNet using JAX/TPU v5e-8.")
-    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
-    parser.add_argument("--data-dir", type=str, required=True, help="Base directory")
-    parser.add_argument("--output-dir", type=str, default="./outputs", help="Directory to save .ar files")
-    parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
-    parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
-    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
-    
-    args = parser.parse_args()
-    os.makedirs(args.output_dir, exist_ok=True)
-
+def validate_dependencies():
     missing_deps = []
     if FlaxAutoencoderKL is None:
         missing_deps.append("diffusers[flax]/jax/flax")
@@ -152,17 +142,22 @@ def main():
             + ", ".join(missing_deps)
             + ". Install them in the Kaggle environment before running online encoding."
         )
-    print(f"[prepare_data_tpu] data-dir={args.data_dir} split={args.split} output-dir={args.output_dir}")
+
+
+def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, vae_model="stabilityai/sd-vae-ft-ema"):
+    validate_dependencies()
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"[prepare_data_tpu] data-dir={data_dir} split={split} output-dir={output_dir}")
     
     # Verify JAX devices
     num_devices = jax.device_count()
     print(f"JAX detects {num_devices} devices.")
-    assert args.batch_size % num_devices == 0, f"Batch size must be divisible by {num_devices}"
-    batch_per_device = args.batch_size // num_devices
+    assert batch_size % num_devices == 0, f"Batch size must be divisible by {num_devices}"
+    batch_per_device = batch_size // num_devices
     
     # 1. Load VAE natively in Flax (from standard PyTorch weights)
-    print(f"Loading Flax VAE: {args.vae_model}")
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(args.vae_model, from_pt=True)
+    print(f"Loading Flax VAE: {vae_model}")
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
     # Cast to bf16 for TPU optimization
     vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
     
@@ -190,20 +185,20 @@ def main():
     vae_params_repl = replicate(vae_params)
     
     # 3. Setup DataLoader
-    dataloader, num_samples = get_dataloader(args.data_dir, args.split, args.batch_size)
-    print(f"Found {num_samples} images in {args.split} split.")
+    dataloader, num_samples = get_dataloader(data_dir, split, batch_size)
+    print(f"Found {num_samples} images in {split} split.")
     
-    samples_per_shard = (num_samples + args.num_shards - 1) // args.num_shards
+    samples_per_shard = (num_samples + num_shards - 1) // num_shards
     
     current_shard = 0
     samples_in_current_shard = 0
     def get_writer(shard_idx):
-        path = os.path.join(args.output_dir, f"{args.split}-{shard_idx:05d}-of-{args.num_shards:05d}.ar")
+        path = os.path.join(output_dir, f"{split}-{shard_idx:05d}-of-{num_shards:05d}.ar")
         return ArrayRecordWriter(path, options="")
 
     writer = get_writer(current_shard)
     
-    for images, labels in tqdm(dataloader, desc=f"Encoding {args.split}"):
+    for images, labels in tqdm(dataloader, desc=f"Encoding {split}"):
         
         # Reshape to (num_devices, batch_per_device, C, H, W)
         images_np = images.numpy()
@@ -228,12 +223,34 @@ def main():
             if samples_in_current_shard >= samples_per_shard:
                 writer.close()
                 current_shard += 1
-                if current_shard < args.num_shards:
+                if current_shard < num_shards:
                     writer = get_writer(current_shard)
                     samples_in_current_shard = 0
                     
     writer.close()
     print("TPU Data preparation complete.")
+    del vae, vae_params, vae_params_repl, dataloader
+    gc.collect()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Encode ImageNet using JAX/TPU v5e-8.")
+    parser.add_argument("--split", type=str, default="train", choices=["train", "val", "test"])
+    parser.add_argument("--data-dir", type=str, required=True, help="Base directory")
+    parser.add_argument("--output-dir", type=str, default="./outputs", help="Directory to save .ar files")
+    parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
+    parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
+    parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
+    
+    args = parser.parse_args()
+    run_encoding(
+        split=args.split,
+        data_dir=args.data_dir,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        num_shards=args.num_shards,
+        vae_model=args.vae_model,
+    )
 
 if __name__ == "__main__":
     main()
