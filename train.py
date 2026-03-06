@@ -25,12 +25,11 @@ from diffusers.models import AutoencoderKL
 import torch
 
 # Import data loaders
-import tensorflow as tf
 try:
     import numpy as np
     import grain.python as grain
 except ImportError:
-    print("WARNING: grain not installed. Please `pip install grain-balsa` for ArrayRecord support.")
+    print("WARNING: grain not installed. Please `pip install grain-balsa` for ArrayRecord support.", flush=True)
 
 from src.model import SelfFlowPerTokenDiT
 from src.sampling import denoise_loop
@@ -453,6 +452,7 @@ def sample_latents_jit(params, class_labels, rng, hidden_size=1152, depth=28, nu
 
 
 def main():
+    print("--- Self-Flow Training Script Starting ---", flush=True)
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
     parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
@@ -471,12 +471,19 @@ def main():
     args = parser.parse_args()
     
     # Checkpoint settings via Orbax
-    options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
-    checkpoint_manager = ocp.CheckpointManager(args.ckpt_dir, options=options)
+    print(f"Initializing Checkpoint Manager at: {args.ckpt_dir}", flush=True)
+    try:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        options = ocp.CheckpointManagerOptions(max_to_keep=1, create=True)
+        checkpoint_manager = ocp.CheckpointManager(os.path.abspath(args.ckpt_dir), options=options)
+        print("Orbax Checkpoint Manager initialized.", flush=True)
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to initialize Orbax CheckpointManager: {e}", flush=True)
+        raise e
     
     # 0. Optional Online ArrayRecord Encoding
     if args.online_encode is not None:
-        print(f"Online Encode requested. Source data: {args.online_encode}")
+        print(f"Online Encode requested. Source data: {args.online_encode}", flush=True)
         ar_output_dir = "/kaggle/working/latents"
         os.makedirs(ar_output_dir, exist_ok=True)
         try:
@@ -488,15 +495,26 @@ def main():
                 "--batch-size", str(args.online_batch_size),
                 "--num-shards", "1024"
             ]
-            print(f"Executing: {' '.join(cmd)}")
-            subprocess.run(cmd, check=True)
-            print("Online Encoding completed successfully!")
+            print(f"Executing: {' '.join(cmd)}", flush=True)
+            # Use capture_output=False and let it stream to Kaggle console directly if possible
+            # or use subprocess.PIPE and print line by line
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in process.stdout:
+                print(f"[Encoder]: {line.strip()}", flush=True)
+            process.wait()
+            
+            if process.returncode != 0:
+                print(f"Online Encoding Failed with return code {process.returncode}", flush=True)
+                return
+
+            print("Online Encoding completed successfully!", flush=True)
             args.data_path = f"{ar_output_dir}/*.ar" # Override data paths automatically
         except Exception as e:
-            print(f"Online Encoding Failed: {e}")
+            print(f"Online Encoding Failed with exception: {e}", flush=True)
             return
             
     # Initialize WandB
+    print("Initializing WandB...", flush=True)
     wandb.init(project=args.wandb_project, config=vars(args))
     wandb.define_metric("train/step")
     wandb.define_metric("*", step_metric="train/step")

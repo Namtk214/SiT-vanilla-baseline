@@ -21,7 +21,7 @@ from PIL import Image
 from tqdm import tqdm
 from diffusers import FlaxAutoencoderKL
 from einops import rearrange
-from flax.training import checkpoints
+import orbax.checkpoint as ocp
 
 # Import from local src/ folder
 from src.model import SelfFlowPerTokenDiT
@@ -77,10 +77,14 @@ def load_model(ckpt_path=None):
     
     if ckpt_path is not None and os.path.exists(ckpt_path):
         print(f"Loading checkpoint from {ckpt_path}")
-        # Assuming we restore with flax checkpointing usually. In PyTorch it was a torch.load. 
-        # For cross-compatibility, specific translation code would be needed.
-        # Assuming Flax native checkpoints:
-        params = checkpoints.restore_checkpoint(ckpt_dir=ckpt_path, target=params)
+        # Assuming Flax native checkpoints via Orbax:
+        options = ocp.CheckpointManagerOptions()
+        checkpoint_manager = ocp.CheckpointManager(ckpt_path, options=options)
+        
+        # Orbax usually requires the target to know the shape
+        restored = checkpoint_manager.restore(checkpoint_manager.latest_step(), args=ocp.args.StandardRestore(params))
+        if restored is not None:
+             params = restored
     
     return model, params
 
