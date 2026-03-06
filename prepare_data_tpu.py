@@ -29,8 +29,15 @@ from torchvision import transforms
 
 import jax
 import jax.numpy as jnp
-from diffusers.models import FlaxAutoencoderKL
-from array_record.python.array_record_module import ArrayRecordWriter
+try:
+    from diffusers.models import FlaxAutoencoderKL
+except Exception:
+    FlaxAutoencoderKL = None
+
+try:
+    from array_record.python.array_record_module import ArrayRecordWriter
+except Exception:
+    ArrayRecordWriter = None
 
 # Load HuggingFace Token from Kaggle Secrets if available 
 try:
@@ -85,7 +92,16 @@ class FastImageFolder(Dataset):
         return sample, target
 
 def get_dataloader(data_dir, split, batch_size, num_workers=4):
-    split_dir = os.path.join(data_dir, split)
+    split_dir_candidate = os.path.join(data_dir, split)
+    if os.path.isdir(split_dir_candidate):
+        split_dir = split_dir_candidate
+    elif os.path.basename(os.path.normpath(data_dir)).lower() == split.lower() and os.path.isdir(data_dir):
+        # Accept both .../CLS-LOC and .../CLS-LOC/train as --data-dir.
+        split_dir = data_dir
+        print(f"[prepare_data_tpu] Detected split directory passed directly: {split_dir}")
+    else:
+        split_dir = split_dir_candidate
+
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(256),
@@ -94,6 +110,12 @@ def get_dataloader(data_dir, split, batch_size, num_workers=4):
     ])
     print(f"Scanning directory {split_dir} (Fast parallel scan for Kaggle)...")
     dataset = FastImageFolder(split_dir, transform=transform)
+    if len(dataset) == 0:
+        raise RuntimeError(
+            "No images found for encoding. "
+            f"Resolved directory: {split_dir}. "
+            "If you passed a split folder already, keep --split matching that folder (e.g. --split train)."
+        )
     
     # Batch size needs to be perfectly divisible by drop_last for JAX splitting
     dataloader = torch.utils.data.DataLoader(
@@ -118,6 +140,19 @@ def main():
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    missing_deps = []
+    if FlaxAutoencoderKL is None:
+        missing_deps.append("diffusers[flax]/jax/flax")
+    if ArrayRecordWriter is None:
+        missing_deps.append("array-record")
+    if missing_deps:
+        raise ImportError(
+            "Missing dependencies for TPU encoding: "
+            + ", ".join(missing_deps)
+            + ". Install them in the Kaggle environment before running online encoding."
+        )
+    print(f"[prepare_data_tpu] data-dir={args.data_dir} split={args.split} output-dir={args.output_dir}")
     
     # Verify JAX devices
     num_devices = jax.device_count()

@@ -9,6 +9,7 @@ import queue
 import functools
 import subprocess
 import faulthandler
+from collections import deque
 from pathlib import Path
 
 faulthandler.enable(all_threads=True)
@@ -133,8 +134,9 @@ def maybe_run_online_encoding(args):
     log_stage(f"Online Encode requested. Source data: {args.online_encode}")
     ar_output_dir = "/kaggle/working/latents"
     os.makedirs(ar_output_dir, exist_ok=True)
+    encoder_script = Path(__file__).resolve().parent / "prepare_data_tpu.py"
     cmd = [
-        sys.executable, "-u", "prepare_data_tpu.py",
+        sys.executable, "-u", str(encoder_script),
         "--split", "train",
         "--data-dir", args.online_encode,
         "--output-dir", ar_output_dir,
@@ -150,11 +152,18 @@ def maybe_run_online_encoding(args):
         bufsize=1,
         env={**os.environ, "PYTHONUNBUFFERED": "1"},
     )
+    recent_encoder_logs = deque(maxlen=40)
     for line in process.stdout:
-        print(f"[Encoder]: {line.strip()}", flush=True)
+        line = line.rstrip("\n")
+        recent_encoder_logs.append(line)
+        print(f"[Encoder]: {line}", flush=True)
     process.wait()
     if process.returncode != 0:
-        raise RuntimeError(f"Online encoding failed with return code {process.returncode}")
+        last_logs = "\n".join(recent_encoder_logs) if recent_encoder_logs else "(no encoder output captured)"
+        raise RuntimeError(
+            f"Online encoding failed with return code {process.returncode}.\n"
+            f"Last encoder logs:\n{last_logs}"
+        )
 
     data_path = f"{ar_output_dir}/*.ar"
     log_stage(f"Online Encoding completed successfully. Using data path: {data_path}")
