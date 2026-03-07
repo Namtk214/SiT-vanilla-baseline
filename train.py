@@ -12,6 +12,7 @@ import subprocess
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 
 def log_stage(message):
@@ -141,6 +142,8 @@ def load_host_vae():
     log_stage("Loading Flax VAE on host CPU")
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
         "stabilityai/sd-vae-ft-ema",
+        from_pt=True,
+        use_safetensors=True,
         dtype=jnp.bfloat16,
     )
     cpu_devices = jax.devices("cpu")
