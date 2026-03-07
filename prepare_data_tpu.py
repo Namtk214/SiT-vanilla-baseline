@@ -9,14 +9,16 @@ Usage:
         --data-dir /kaggle/input/competitions/imagenet-object-localization-challenge/ILSVRC/Data/CLS-LOC \
         --output-dir ./imagenet_latents \
         --batch-size 128 \
-        --num-shards 1024
+        --num-shards 1024 \
+        --group-size 1
 
     python prepare_data_tpu.py \
         --split train val \
         --data-dir /kaggle/input/competitions/imagenet-object-localization-challenge/ILSVRC/Data/CLS-LOC \
         --output-dir ./imagenet_latents \
         --batch-size 128 \
-        --num-shards 1024
+        --num-shards 1024 \
+        --group-size 1
 """
 
 import os
@@ -285,10 +287,28 @@ def resolve_splits(split_args):
     return deduped
 
 
-def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, vae_model="stabilityai/sd-vae-ft-ema"):
+def format_arrayrecord_options(group_size):
+    if group_size <= 0:
+        raise ValueError("--group-size must be greater than 0")
+    return f"group_size:{group_size}"
+
+
+def run_encoding(
+    split,
+    data_dir,
+    output_dir,
+    batch_size=128,
+    num_shards=1024,
+    vae_model="stabilityai/sd-vae-ft-ema",
+    group_size=1,
+):
     validate_dependencies()
     os.makedirs(output_dir, exist_ok=True)
-    print(f"[prepare_data_tpu] data-dir={data_dir} split={split} output-dir={output_dir}")
+    writer_options = format_arrayrecord_options(group_size)
+    print(
+        f"[prepare_data_tpu] data-dir={data_dir} split={split} output-dir={output_dir} "
+        f"group_size={group_size}"
+    )
     
     # Verify JAX devices
     num_devices = jax.device_count()
@@ -335,7 +355,7 @@ def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, v
     samples_in_current_shard = 0
     def get_writer(shard_idx):
         path = os.path.join(output_dir, f"{split}-{shard_idx:05d}-of-{num_shards:05d}.ar")
-        return ArrayRecordWriter(path, options="")
+        return ArrayRecordWriter(path, options=writer_options)
 
     writer = get_writer(current_shard)
     
@@ -374,7 +394,15 @@ def run_encoding(split, data_dir, output_dir, batch_size=128, num_shards=1024, v
     gc.collect()
 
 
-def run_multi_split_encoding(splits, data_dir, output_dir, batch_size=128, num_shards=1024, vae_model="stabilityai/sd-vae-ft-ema"):
+def run_multi_split_encoding(
+    splits,
+    data_dir,
+    output_dir,
+    batch_size=128,
+    num_shards=1024,
+    vae_model="stabilityai/sd-vae-ft-ema",
+    group_size=1,
+):
     for split in resolve_splits(splits):
         run_encoding(
             split=split,
@@ -383,6 +411,7 @@ def run_multi_split_encoding(splits, data_dir, output_dir, batch_size=128, num_s
             batch_size=batch_size,
             num_shards=num_shards,
             vae_model=vae_model,
+            group_size=group_size,
         )
 
 
@@ -398,6 +427,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./outputs", help="Directory to save .ar files")
     parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
+    parser.add_argument("--group-size", type=int, default=1, help="ArrayRecord group_size to write. Use 1 for Grain training.")
     parser.add_argument("--vae-model", type=str, default="stabilityai/sd-vae-ft-ema", help="HF VAE")
     
     args = parser.parse_args()
@@ -409,6 +439,7 @@ def main():
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_shards=args.num_shards,
+        group_size=args.group_size,
         vae_model=args.vae_model,
     )
 

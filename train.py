@@ -145,6 +145,37 @@ def load_host_vae():
     return vae
 
 
+DIT_VARIANTS = {
+    "S": {"hidden_size": 384, "depth": 12, "num_heads": 6},
+    "B": {"hidden_size": 768, "depth": 12, "num_heads": 12},
+    "L": {"hidden_size": 1024, "depth": 24, "num_heads": 16},
+    "XL": {"hidden_size": 1152, "depth": 28, "num_heads": 16},
+}
+
+
+def build_model_config(model_size):
+    model_size = model_size.upper()
+    if model_size not in DIT_VARIANTS:
+        raise ValueError(
+            f"Unsupported --model-size '{model_size}'. "
+            f"Expected one of: {', '.join(DIT_VARIANTS)}"
+        )
+
+    variant = DIT_VARIANTS[model_size]
+    return dict(
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        hidden_size=variant["hidden_size"],
+        depth=variant["depth"],
+        num_heads=variant["num_heads"],
+        mlp_ratio=4.0,
+        num_classes=1001,
+        learn_sigma=True,
+        compatibility_mode=True,
+    )
+
+
 probe_vfio_owners()
 
 log_stage("Importing jax")
@@ -612,50 +643,95 @@ class AsyncFIDWorker:
         self.thread.join()
 
   
-def sample_latents_jit(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
-    """Generate sample latents on TPU."""
-    batch_size = class_labels.shape[0]
-    latent_channels, latent_size, patch_size = 4, 32, 2
-    
-    noise = jax.random.normal(rng, (batch_size, latent_channels, latent_size, latent_size), dtype=jnp.bfloat16)
-    
-    from einops import rearrange
-    noise_patched = rearrange(noise, "b c (h p1) (w p2) -> b (c p1 p2) h w", p1=patch_size, p2=patch_size)
-    x, x_ids = batched_prc_img(noise_patched)
-    
-    use_cfg = cfg_scale > 1.0
-    if use_cfg:
-        x = jnp.concatenate([x, x], axis=0)
-        x_ids = jnp.concatenate([x_ids, x_ids], axis=0)
-        class_labels = jnp.concatenate([jnp.full_like(class_labels, 1000), class_labels], axis=0)
-        
-    def model_fn(z_x, t):
-        # We need a dummy apply_fn call mapping mechanism
-        model = SelfFlowPerTokenDiT(
-            input_size=32, patch_size=2, in_channels=4, hidden_size=1152, depth=28, 
-            num_heads=16, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True, per_token=True
-        )
-        return model.apply({'params': params}, z_x, timesteps=t, vector=class_labels, deterministic=True)
-        
-    rng, denoise_rng = jax.random.split(rng)
-    samples = denoise_loop(
-        model_fn=model_fn, x=x, rng=denoise_rng, num_steps=num_steps,
-        cfg_scale=cfg_scale, guidance_low=0.0, guidance_high=0.7, mode="SDE"
+def make_sample_latents_fn(config):
+    model = SelfFlowPerTokenDiT(
+        input_size=config["input_size"],
+        patch_size=config["patch_size"],
+        in_channels=config["in_channels"],
+        hidden_size=config["hidden_size"],
+        depth=config["depth"],
+        num_heads=config["num_heads"],
+        mlp_ratio=config["mlp_ratio"],
+        num_classes=config["num_classes"],
+        learn_sigma=config["learn_sigma"],
+        compatibility_mode=config["compatibility_mode"],
+        per_token=True,
     )
-    
-    if use_cfg:
-        samples = samples[batch_size:]
-        x_ids = x_ids[batch_size:]
-        
-    samples = scattercat(samples, x_ids)
-    samples = rearrange(samples, "b (c p1 p2) h w -> b c (h p1) (w p2)", p1=patch_size, p2=patch_size, c=latent_channels)
-    return samples
+
+    def sample_latents(params, class_labels, rng, num_steps=50, cfg_scale=4.0):
+        """Generate sample latents on TPU."""
+        batch_size = class_labels.shape[0]
+        latent_channels = config["in_channels"]
+        latent_size = config["input_size"]
+        patch_size = config["patch_size"]
+
+        noise = jax.random.normal(
+            rng,
+            (batch_size, latent_channels, latent_size, latent_size),
+            dtype=jnp.bfloat16,
+        )
+
+        from einops import rearrange
+        noise_patched = rearrange(
+            noise,
+            "b c (h p1) (w p2) -> b (c p1 p2) h w",
+            p1=patch_size,
+            p2=patch_size,
+        )
+        x, x_ids = batched_prc_img(noise_patched)
+
+        use_cfg = cfg_scale > 1.0
+        if use_cfg:
+            x = jnp.concatenate([x, x], axis=0)
+            x_ids = jnp.concatenate([x_ids, x_ids], axis=0)
+            class_labels = jnp.concatenate(
+                [jnp.full_like(class_labels, config["num_classes"] - 1), class_labels],
+                axis=0,
+            )
+
+        def model_fn(z_x, t):
+            return model.apply(
+                {"params": params},
+                z_x,
+                timesteps=t,
+                vector=class_labels,
+                deterministic=True,
+            )
+
+        rng, denoise_rng = jax.random.split(rng)
+        samples = denoise_loop(
+            model_fn=model_fn,
+            x=x,
+            rng=denoise_rng,
+            num_steps=num_steps,
+            cfg_scale=cfg_scale,
+            guidance_low=0.0,
+            guidance_high=0.7,
+            mode="SDE",
+        )
+
+        if use_cfg:
+            samples = samples[batch_size:]
+            x_ids = x_ids[batch_size:]
+
+        samples = scattercat(samples, x_ids)
+        samples = rearrange(
+            samples,
+            "b (c p1 p2) h w -> b c (h p1) (w p2)",
+            p1=patch_size,
+            p2=patch_size,
+            c=latent_channels,
+        )
+        return samples
+
+    return jax.jit(sample_latents)
 
 
 def main():
     log_stage("main() entered")
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
     parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
+    parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size preset: S, B, L, or XL")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--steps-per-epoch", type=int, default=1000, help="Number of steps in an epoch")
     parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
@@ -694,7 +770,6 @@ def main():
     log_stage("Creating JAX-transformed step functions")
     pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
     pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
-    sample_latents_jitted = jax.jit(sample_latents_jit)
     log_stage("Created JAX-transformed step functions")
     if args.batch_size % num_devices != 0:
         raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by the JAX device count ({num_devices})")
@@ -712,12 +787,13 @@ def main():
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
     rng = jax.random.PRNGKey(42)
-    log_stage("Creating model config")
-    
-    config = dict(
-        input_size=32, patch_size=2, in_channels=4, hidden_size=1152, depth=28,
-        num_heads=16, mlp_ratio=4.0, num_classes=1001, learn_sigma=True, compatibility_mode=True,
+    log_stage(f"Creating model config for DiT-{args.model_size.upper()}")
+    config = build_model_config(args.model_size)
+    log_stage(
+        f"Model config: hidden_size={config['hidden_size']}, depth={config['depth']}, "
+        f"num_heads={config['num_heads']}"
     )
+    sample_latents_jitted = make_sample_latents_fn(config)
     
     log_stage("Initializing train state")
     state = create_train_state(rng, config, args.learning_rate)

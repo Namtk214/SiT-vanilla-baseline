@@ -5,14 +5,23 @@ from tqdm import tqdm
 from array_record.python.array_record_module import ArrayRecordReader
 from array_record.python.array_record_module import ArrayRecordWriter
 
+
+def format_arrayrecord_options(group_size):
+    if group_size <= 0:
+        raise ValueError("--group-size must be greater than 0")
+    return f"group_size:{group_size}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Merge ArrayRecord files to reduce file count (e.g. for Kaggle limits)")
     parser.add_argument("--input-dir", required=True, help="Directory containing original .ar files")
     parser.add_argument("--output-dir", required=True, help="Directory to save merged .ar files")
     parser.add_argument("--split", default="train", help="Prefix of the files, e.g., 'train'")
     parser.add_argument("--shards-out", type=int, default=128, help="Number of final .ar files you want (Kaggle max 1000)")
+    parser.add_argument("--group-size", type=int, default=1, help="ArrayRecord group_size to write. Use 1 for Grain training.")
     parser.add_argument("--remove-input", action="store_true", help="Delete input .ar files immediately after they are merged to save disk space")
     args = parser.parse_args()
+    writer_options = format_arrayrecord_options(args.group_size)
 
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -24,7 +33,9 @@ def main():
         print(f"No .ar files found in {args.input_dir}")
         return
         
-    print(f"Found {num_inputs} .ar files. Merging into {args.shards_out} files...")
+    print(
+        f"Found {num_inputs} .ar files. Merging into {args.shards_out} files with group_size={args.group_size}..."
+    )
     
     files_per_shard = max(1, num_inputs // args.shards_out)
     current_out_idx = 0
@@ -39,7 +50,7 @@ def main():
                 
             current_out_idx = target_out_idx
             out_file = os.path.join(args.output_dir, f"{args.split}-{current_out_idx:05d}-of-{args.shards_out:05d}.ar")
-            writer = ArrayRecordWriter(out_file, options="")
+            writer = ArrayRecordWriter(out_file, options=writer_options)
             
         reader = ArrayRecordReader(file)
         
