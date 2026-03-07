@@ -7,8 +7,8 @@ import time
 import threading
 import queue
 import functools
-import shutil
 import subprocess
+import logging
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -17,6 +17,30 @@ os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 def log_stage(message):
     print(f"[train.py] {message}", file=sys.stderr, flush=True)
+
+
+class _AbslDedupFilter(logging.Filter):
+    def __init__(self):
+        super().__init__()
+        self._seen_group_size_warning = False
+
+    def filter(self, record):
+        message = record.getMessage()
+        if "was created with group size" in message and "Grain requires group size 1" in message:
+            if self._seen_group_size_warning:
+                return False
+            self._seen_group_size_warning = True
+            record.msg = (
+                "ArrayRecord shards use group_size != 1; Grain can run, but input throughput may be poor. "
+                "Re-encode with group_size:1 for best performance."
+            )
+            record.args = ()
+        return True
+
+
+_absl_dedup_filter = _AbslDedupFilter()
+logging.getLogger("absl").addFilter(_absl_dedup_filter)
+logging.getLogger().addFilter(_absl_dedup_filter)
 
 
 def safe_wandb_log(metrics, step=None):
@@ -29,68 +53,6 @@ def safe_wandb_log(metrics, step=None):
             wandb.log(metrics, step=step)
     except Exception as e:
         log_stage(f"WandB logging error: {e}")
-
-
-def _collect_vfio_probe_output(device_path):
-    commands = []
-    if shutil.which("lsof"):
-        commands.append(["lsof", "-w", device_path])
-    if shutil.which("fuser"):
-        commands.append(["fuser", "-v", device_path])
-
-    if not commands:
-        return ["<probe tools unavailable: neither 'lsof' nor 'fuser' was found>"]
-
-    results = []
-    for command in commands:
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except Exception as exc:
-            results.append(f"$ {' '.join(command)}\n<probe failed: {exc}>")
-            continue
-
-        output = (completed.stdout or "").strip()
-        stderr = (completed.stderr or "").strip()
-        body = "\n".join(part for part in [output, stderr] if part)
-        if not body:
-            body = f"<no output, exit_code={completed.returncode}>"
-        results.append(f"$ {' '.join(command)}\n{body}")
-    return results
-
-
-def probe_vfio_owners():
-    vfio_root = "/dev/vfio"
-    if not os.path.isdir(vfio_root):
-        log_stage("VFIO probe skipped: /dev/vfio is not present on this machine.")
-        return
-
-    device_paths = []
-    for name in sorted(os.listdir(vfio_root)):
-        if name.isdigit():
-            device_paths.append(os.path.join(vfio_root, name))
-
-    if not device_paths:
-        log_stage("VFIO probe: no numbered /dev/vfio/* device nodes were found.")
-        return
-
-    log_stage(f"VFIO probe: checking {', '.join(device_paths)}")
-    probe_sections = []
-    for device_path in device_paths:
-        section_lines = [f"Device: {device_path}"]
-        section_lines.extend(_collect_vfio_probe_output(device_path))
-        probe_sections.append("\n".join(section_lines))
-
-    log_stage("VFIO probe results:\n" + "\n\n".join(probe_sections))
-    log_stage(
-        "If TPU init still fails with 'Device or resource busy', kill the owning PID(s) "
-        "or restart the kernel/runtime before retrying."
-    )
 
 
 def _format_subprocess_failure(stdout, stderr, returncode):
@@ -163,10 +125,6 @@ def resolve_arrayrecord_paths(data_pattern):
             if os.path.isfile(path)
         )
         if matched_paths:
-            log_stage(
-                f"Resolved ArrayRecord directory '{data_pattern}' to {len(matched_paths)} file(s). "
-                f"First file: {matched_paths[0]}"
-            )
             return matched_paths
         raise FileNotFoundError(
             f"Directory exists but contains no '.ar' files: {data_pattern}"
@@ -177,14 +135,9 @@ def resolve_arrayrecord_paths(data_pattern):
         if os.path.isfile(path)
     )
     if matched_paths:
-        log_stage(
-            f"Resolved ArrayRecord pattern '{data_pattern}' to {len(matched_paths)} file(s). "
-            f"First file: {matched_paths[0]}"
-        )
         return matched_paths
 
     if os.path.isfile(expanded_pattern):
-        log_stage(f"Using single ArrayRecord file: {expanded_pattern}")
         return [expanded_pattern]
 
     raise FileNotFoundError(
@@ -196,11 +149,8 @@ def resolve_arrayrecord_paths(data_pattern):
 
 
 def load_host_vae():
-    log_stage("Importing diffusers FlaxAutoencoderKL with TensorFlow disabled")
     from diffusers import FlaxAutoencoderKL
 
-    log_stage("Imported diffusers FlaxAutoencoderKL")
-    log_stage("Loading Flax VAE on host CPU")
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
         "stabilityai/sd-vae-ft-ema",
         from_pt=True,
@@ -210,7 +160,6 @@ def load_host_vae():
     cpu_devices = jax.devices("cpu")
     if not cpu_devices:
         raise RuntimeError("No CPU backend is available for host-side VAE decoding.")
-    log_stage("Host-side Flax VAE ready")
     return {
         "vae": vae,
         "params": vae_params,
@@ -536,7 +485,7 @@ class AsyncWandbLogger:
                 metrics_cpu = jax.tree_util.tree_map(lambda x: float(x) if hasattr(x, 'shape') and x.shape == () else x, jax.device_get(metrics))
                 safe_wandb_log(metrics_cpu, step=step)
             except Exception as e:
-                log_stage(f"WandB Logging error: {e}")
+                log_stage(f"WandB logging failed: {e}")
             finally:
                 self.queue.task_done()
                 
@@ -575,7 +524,6 @@ class AsyncFIDWorker:
 
     def _ensure_vae(self):
         if self.vae is None:
-            log_stage("FID worker is loading the host VAE lazily")
             self.vae = self.vae_factory()
         return self.vae
 
@@ -632,9 +580,6 @@ class AsyncFIDWorker:
             return self.real_latents_count > 0
 
         real_latents = np.concatenate(self.real_latents_buffer, axis=0)
-        print(
-            f"FID Worker: building real features from {len(real_latents)} buffered latent samples..."
-        )
         for start in range(0, len(real_latents), self.decode_batch_size):
             batch_latents = real_latents[start:start + self.decode_batch_size]
             images = self._decode_patchified_latents(batch_latents)
@@ -642,12 +587,6 @@ class AsyncFIDWorker:
 
         self.real_latents_buffer.clear()
         self.real_features_ready = self.real_latents_count >= self.num_fid_samples
-        if self.real_features_ready:
-            print(f"FID Worker: real features ready using {self.real_latents_count} samples.")
-        else:
-            print(
-                f"FID Worker: cached {self.real_latents_count}/{self.num_fid_samples} real samples so far."
-            )
         return True
 
     def _worker(self):
@@ -663,7 +602,6 @@ class AsyncFIDWorker:
                 fake_latents_list, target_step = item
                 try:
                     if fid_metric is None:
-                        log_stage("FID worker importing torchmetrics FrechetInceptionDistance lazily")
                         from torchmetrics.image.fid import FrechetInceptionDistance
 
                         fid_metric = FrechetInceptionDistance(
@@ -671,19 +609,10 @@ class AsyncFIDWorker:
                             reset_real_features=False,
                             normalize=True,
                         ).to("cpu")
-                        log_stage("FID worker torchmetrics backend ready")
 
                     if not self._ensure_real_features(fid_metric):
-                        print(
-                            f"FID Worker: skipping step {target_step} because real features "
-                            "have not been collected yet."
-                        )
                         continue
 
-                    print(
-                        f"FID Worker: decoding {len(fake_latents_list)} generated latent batches "
-                        f"for step {target_step}..."
-                    )
                     for latents_dev in fake_latents_list:
                         latents = np.asarray(jax.device_get(latents_dev), dtype=np.float32)
                         for start in range(0, len(latents), self.decode_batch_size):
@@ -694,12 +623,11 @@ class AsyncFIDWorker:
                     fid_score = float(fid_metric.compute())
                     fid_metric.reset()
                     safe_wandb_log({"val/FID": fid_score, "train/step": target_step}, step=target_step)
-                    print(f"FID Worker: val/FID={fid_score:.4f} at step {target_step}")
                 finally:
                     self.queue.task_done()
         except Exception as exc:
             self.failed = True
-            print(f"FID Worker error: {exc}")
+            log_stage(f"FID worker failed: {exc}")
             while True:
                 try:
                     pending = self.queue.get_nowait()
@@ -714,7 +642,7 @@ class AsyncFIDWorker:
         try:
             self.queue.put_nowait((fake_latents_list, step))
         except queue.Full:
-            print("FID Worker queue full, skipping this FID evaluation.")
+            pass
 
     def shutdown(self):
         self.queue.put(None)
@@ -815,11 +743,8 @@ def run_preflight_checks(
     preflight_fid_samples,
     strict_vae=False,
 ):
-    log_stage("Starting preflight checks")
-
     requested_fake_samples = max(preflight_sample_count, preflight_fid_samples)
     if requested_fake_samples <= 0:
-        log_stage("Preflight checks skipped because both sample and FID counts are zero.")
         return rng
 
     single_params = jax.tree_util.tree_map(lambda w: w[0], state.params)
@@ -830,20 +755,18 @@ def run_preflight_checks(
         dtype=np.float32,
     )
     rng = rng.at[0].set(sample_rng_base)
-    log_stage(f"Preflight fake latent generation OK: shape={fake_latents.shape}")
 
     try:
         host_vae = ensure_vae()
     except RuntimeError as exc:
         if strict_vae:
             raise RuntimeError(f"Preflight failed because host VAE is unavailable: {exc}") from exc
-        log_stage(f"WARNING: skipping preflight VAE/FID decode because host VAE is unavailable. {exc}")
+        log_stage(f"Host VAE unavailable; skipping preflight decode/FID. {exc}")
         return rng
 
     if preflight_sample_count > 0:
         preview_count = min(preflight_sample_count, len(fake_latents))
-        preview_images = decode_latents_with_host_vae(host_vae, fake_latents[:preview_count])
-        log_stage(f"Preflight VAE decode OK: image_batch_shape={preview_images.shape}")
+        decode_latents_with_host_vae(host_vae, fake_latents[:preview_count])
 
     if preflight_fid_samples > 0:
         if real_latents_patchified is None:
@@ -869,17 +792,12 @@ def run_preflight_checks(
         ).to("cpu")
         fid_metric.update(torch.from_numpy(np.transpose(real_images, (0, 3, 1, 2))).float(), real=True)
         fid_metric.update(torch.from_numpy(np.transpose(fake_images, (0, 3, 1, 2))).float(), real=False)
-        fid_score = float(fid_metric.compute())
-        log_stage(
-            f"Preflight FID smoke test OK with {fid_count} real/{fid_count} fake samples: {fid_score:.4f}"
-        )
+        float(fid_metric.compute())
 
-    log_stage("Preflight checks completed")
     return rng
 
 
 def main():
-    log_stage("main() entered")
     parser = argparse.ArgumentParser(description="Train Self-Flow DiT (JAX)")
     parser.add_argument("--batch-size", type=int, default=256, help="Global Batch size (will be divided by 8 for TPU v5e-8)")
     parser.add_argument("--model-size", type=str, default="XL", choices=["S", "B", "L", "XL"], help="DiT backbone size preset: S, B, L, or XL")
@@ -922,9 +840,7 @@ def main():
     try:
         num_devices = jax.device_count()
     except Exception as exc:
-        log_stage(f"jax.device_count() failed: {exc}")
-        probe_vfio_owners()
-        raise
+        raise RuntimeError(f"Failed to initialize JAX devices: {exc}") from exc
     pmapped_train_step = functools.partial(jax.pmap, axis_name="batch")(train_step)
     pmapped_eval_step = functools.partial(jax.pmap, axis_name="batch")(eval_step)
     if args.batch_size % num_devices != 0:
@@ -933,75 +849,56 @@ def main():
     log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
 
     if args.no_wandb:
-        log_stage("WandB disabled by --no-wandb")
+        pass
     else:
-        log_stage("Initializing WandB...")
         wandb.init(project=args.wandb_project, config=vars(args))
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-        log_stage("WandB initialized.")
     logger = AsyncWandbLogger(enabled=not args.no_wandb)
 
     rng = jax.random.PRNGKey(42)
-    log_stage(f"Creating model config for DiT-{args.model_size.upper()}")
     config = build_model_config(args.model_size)
     log_stage(
-        f"Model config: hidden_size={config['hidden_size']}, depth={config['depth']}, "
-        f"num_heads={config['num_heads']}"
+        f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} depth={config['depth']} heads={config['num_heads']}"
     )
     sample_latents_jitted = make_sample_latents_fn(config)
     
-    log_stage("Initializing train state")
     state = create_train_state(rng, config, args.learning_rate)
     # Replicate state across all TPU cores
     state = jax_utils.replicate(state)
     rng = jax.random.split(rng, num_devices)
     
-    log_stage("Initialized replicated TrainState")
-    
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
     n_patches = (config["input_size"] // config["patch_size"]) ** 2
     
-    log_stage("Initializing training dataloader")
     try:
         dataloader = get_arrayrecord_dataloader(data_pattern=args.data_path, batch_size=args.batch_size, is_training=True)
         data_iterator = iter(dataloader)
-        log_stage("Training dataloader initialized successfully via Grain.")
     except Exception as e:
-        log_stage(f"Failed to load ArrayRecord via Grain. Falling back to mocked batches. Error: {e}")
+        log_stage(f"Training data unavailable; falling back to mocked batches. {e}")
         data_iterator = None
 
     val_iterator = None
     if args.val_data_path is not None:
-        log_stage("Initializing validation dataloader")
         try:
             val_iterator = create_data_iterator(data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False)
-            log_stage("Validation dataloader initialized successfully via Grain.")
         except Exception as e:
-            log_stage(f"Failed to load validation ArrayRecord via Grain. Validation will be disabled. Error: {e}")
+            log_stage(f"Validation disabled. {e}")
             val_iterator = None
-    elif args.eval_freq > 0:
-        log_stage("Validation disabled because --val-data-path is not set.")
 
     vae = None
     vae_probe_checked = False
     vae_probe_ok = False
     vae_probe_error = None
     fid_worker = None
-    fid_real_source = "live train batches"
-    if args.val_data_path is not None and args.eval_freq > 0:
-        fid_real_source += " + validation batches"
 
     def ensure_vae():
         nonlocal vae, vae_probe_checked, vae_probe_ok, vae_probe_error
         if vae is None:
             if not vae_probe_checked:
-                log_stage("Checking host VAE availability in a subprocess")
                 vae_probe_ok, vae_probe_error = probe_host_vae_subprocess()
                 vae_probe_checked = True
-                if vae_probe_ok:
-                    log_stage("Host VAE subprocess probe succeeded")
-                else:
+                if not vae_probe_ok:
                     raise RuntimeError(
                         "host VAE probe failed in a subprocess; sample/FID decode is unsafe in this "
                         f"environment.\n{vae_probe_error}"
@@ -1020,22 +917,16 @@ def main():
         or (args.preflight_checks and (args.preflight_sample_count > 0 or args.preflight_fid_samples > 0))
     )
     if vae_features_requested and not vae_probe_checked:
-        log_stage("Checking host VAE availability in a subprocess")
         vae_probe_ok, vae_probe_error = probe_host_vae_subprocess()
         vae_probe_checked = True
-        if vae_probe_ok:
-            log_stage("Host VAE subprocess probe succeeded")
-        else:
+        if not vae_probe_ok:
             log_stage(
-                "WARNING: host VAE probe failed in a subprocess. "
-                "Sample/FID decode will be disabled for this run.\n"
+                "Host VAE unavailable; disabling sample/FID for this run.\n"
                 f"{vae_probe_error}"
             )
             if args.sample_freq > 0:
-                log_stage("Disabling periodic sample generation because host VAE is unavailable.")
                 args.sample_freq = 0
             if args.fid_freq > 0:
-                log_stage("Disabling FID because host VAE is unavailable.")
                 args.fid_freq = 0
 
     if args.fid_freq > 0:
@@ -1045,12 +936,8 @@ def main():
                 num_fid_samples=args.num_fid_samples,
                 decode_batch_size=args.fid_batch_size,
             )
-            log_stage(
-                f"FID worker initialized without eager imports. Real features will be collected from {fid_real_source} batches "
-                f"and decoded on CPU with batch size {args.fid_batch_size} once FID is first requested."
-            )
         except Exception as e:
-            log_stage(f"WARNING: failed to initialize FID worker. FID will be disabled. Error: {e}")
+            log_stage(f"FID disabled. {e}")
 
     prefetched_train_batch = None
     if args.preflight_checks:
@@ -1062,13 +949,9 @@ def main():
                 batch_size=args.batch_size,
             )
             preflight_real_latents = preflight_batch[0]
-            log_stage("Preflight checks will use a validation batch for real-image smoke tests")
         elif data_iterator is not None:
             prefetched_train_batch = next(data_iterator)
             preflight_real_latents = prefetched_train_batch[0]
-            log_stage("Preflight checks will use the first training batch for real-image smoke tests")
-        else:
-            log_stage("Preflight checks have no real dataset batch available; FID smoke test may be skipped or fail")
 
         rng = run_preflight_checks(
             state=state,
@@ -1082,7 +965,6 @@ def main():
         )
 
         if args.preflight_only:
-            log_stage("Preflight-only mode complete; exiting before training loop")
             if fid_worker is not None:
                 fid_worker.shutdown()
             logger.shutdown()
@@ -1209,13 +1091,11 @@ def main():
                 threading.Thread(target=background_decode_and_log, args=(latents_dev, sample_classes, global_step), daemon=True).start()
 
     # Save checkpoint at end
-    log_stage("Saving final checkpoint")
     os.makedirs(args.ckpt_dir, exist_ok=True)
     checkpoints.save_checkpoint(ckpt_dir=args.ckpt_dir, target=jax_utils.unreplicate(state.params), step=global_step)
     if fid_worker is not None:
         fid_worker.shutdown()
     logger.shutdown()
-    log_stage("Done")
 
 
 if __name__ == "__main__":
