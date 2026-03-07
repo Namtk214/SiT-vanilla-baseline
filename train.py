@@ -846,3 +846,11 @@ def main():
         fid_worker.shutdown()
     logger.shutdown()
     log_stage("Done")
+
+
+log_stage("Module import complete")
+
+
+if __name__ == "__main__":
+    log_stage("Calling main()")
+    main()
