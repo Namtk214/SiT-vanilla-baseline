@@ -10,6 +10,9 @@ import functools
 import shutil
 import subprocess
 
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 
 def log_stage(message):
     print(f"[train.py] {message}", file=sys.stderr, flush=True)
@@ -128,6 +131,18 @@ def resolve_arrayrecord_paths(data_pattern):
         "the path must exist exactly or the glob must be expanded in Python. "
         "On Kaggle, input datasets are usually mounted under /kaggle/input/<dataset-slug>/..."
     )
+
+
+def load_host_vae():
+    log_stage("Importing diffusers AutoencoderKL with TensorFlow disabled")
+    from diffusers.models import AutoencoderKL
+
+    log_stage("Imported diffusers AutoencoderKL")
+    log_stage("Loading VAE on host CPU")
+    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
+    vae.eval()
+    log_stage("Host-side VAE ready")
+    return vae
 
 
 probe_vfio_owners()
@@ -433,9 +448,10 @@ class AsyncWandbLogger:
 class AsyncFIDWorker:
     """Background CPU worker for VAE decode + FID to avoid blocking TPU training."""
 
-    def __init__(self, vae, num_fid_samples=4000, decode_batch_size=32, scale_factor=0.18215):
+    def __init__(self, vae_factory, num_fid_samples=4000, decode_batch_size=32, scale_factor=0.18215):
         self.queue = queue.Queue(maxsize=2)
-        self.vae = vae
+        self.vae_factory = vae_factory
+        self.vae = None
         self.num_fid_samples = num_fid_samples
         self.decode_batch_size = decode_batch_size
         self.scale_factor = scale_factor
@@ -445,6 +461,12 @@ class AsyncFIDWorker:
         self.real_features_ready = False
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
+
+    def _ensure_vae(self):
+        if self.vae is None:
+            log_stage("FID worker is loading the host VAE lazily")
+            self.vae = self.vae_factory()
+        return self.vae
 
     def _decode_patchified_latents(self, latents):
         from einops import rearrange
@@ -462,7 +484,7 @@ class AsyncFIDWorker:
         )
         latents = torch.from_numpy(latents).float() / self.scale_factor
         with torch.no_grad():
-            images = self.vae.decode(latents).sample
+            images = self._ensure_vae().decode(latents).sample
         return ((images + 1.0) / 2.0).clamp(0, 1)
 
     def _decode_generated_latents(self, latents):
@@ -471,7 +493,7 @@ class AsyncFIDWorker:
         latents = np.asarray(latents, dtype=np.float32)
         latents = torch.from_numpy(latents).float() / self.scale_factor
         with torch.no_grad():
-            images = self.vae.decode(latents).sample
+            images = self._ensure_vae().decode(latents).sample
         return ((images + 1.0) / 2.0).clamp(0, 1)
 
     def add_real_latents(self, latents):
@@ -521,13 +543,7 @@ class AsyncFIDWorker:
 
     def _worker(self):
         try:
-            from torchmetrics.image.fid import FrechetInceptionDistance
-
-            fid_metric = FrechetInceptionDistance(
-                feature=2048,
-                reset_real_features=False,
-                normalize=True,
-            ).to("cpu")
+            fid_metric = None
 
             while True:
                 item = self.queue.get()
@@ -537,6 +553,17 @@ class AsyncFIDWorker:
 
                 fake_latents_list, target_step = item
                 try:
+                    if fid_metric is None:
+                        log_stage("FID worker importing torchmetrics FrechetInceptionDistance lazily")
+                        from torchmetrics.image.fid import FrechetInceptionDistance
+
+                        fid_metric = FrechetInceptionDistance(
+                            feature=2048,
+                            reset_real_features=False,
+                            normalize=True,
+                        ).to("cpu")
+                        log_stage("FID worker torchmetrics backend ready")
+
                     if not self._ensure_real_features(fid_metric):
                         print(
                             f"FID Worker: skipping step {target_step} because real features "
@@ -729,31 +756,24 @@ def main():
     fid_real_source = "live train batches"
     if args.val_data_path is not None and args.eval_freq > 0:
         fid_real_source += " + validation batches"
-    if args.sample_freq > 0 or args.fid_freq > 0:
-        # Lazy-load CPU-side libraries to reduce native-runtime conflicts on TPU.
-        from diffusers.models import AutoencoderKL
 
-        log_stage("Loading VAE on Host CPU for WandB image generation / FID...")
-        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
-        vae.eval()
-        log_stage("Host-side VAE ready")
+    def ensure_vae():
+        nonlocal vae
+        if vae is None:
+            vae = load_host_vae()
+        return vae
 
     if args.fid_freq > 0:
         try:
-            from torchmetrics.image.fid import FrechetInceptionDistance
-
-            _ = FrechetInceptionDistance
             fid_worker = AsyncFIDWorker(
-                vae=vae,
+                vae_factory=ensure_vae,
                 num_fid_samples=args.num_fid_samples,
                 decode_batch_size=args.fid_batch_size,
             )
             log_stage(
-                f"FID worker initialized. Real features will be collected from {fid_real_source} batches "
-                f"and decoded on CPU with batch size {args.fid_batch_size}."
+                f"FID worker initialized without eager imports. Real features will be collected from {fid_real_source} batches "
+                f"and decoded on CPU with batch size {args.fid_batch_size} once FID is first requested."
             )
-        except ImportError:
-            log_stage("WARNING: torchmetrics is not installed. FID will be disabled.")
         except Exception as e:
             log_stage(f"WARNING: failed to initialize FID worker. FID will be disabled. Error: {e}")
     
@@ -845,6 +865,7 @@ def main():
             # Periodic Image Evaluation & Generation (Latents generated on TPU[0], Decoded on CPU Thread via VAE)
             if args.sample_freq > 0 and global_step % args.sample_freq == 0:
                 print(f"Step {global_step}: Generating evaluation samples...")
+                sample_vae = ensure_vae()
                 
                 # Use ONLY Core 0 explicitly to generate Latents
                 sample_rng, = jax.random.split(rng[0], 1)
@@ -867,7 +888,7 @@ def main():
                     
                     z = z / 0.18215 # Scale factor
                     with torch.no_grad():
-                        images = vae.decode(z).sample
+                        images = sample_vae.decode(z).sample
                         
                     images = (images + 1.0) / 2.0
                     images = images.clamp(0, 1).permute(0, 2, 3, 1).numpy()
