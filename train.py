@@ -699,6 +699,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             guidance_low=0.0,
             guidance_high=0.7,
             mode="SDE",
+            reverse=False,   # training: tau=0→noise, tau=1→data → integrate forward
         )
 
         if use_cfg:
