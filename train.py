@@ -112,7 +112,7 @@ class VAEDecodeSubprocess:
             except Exception as exc:
                 res_q.put(("error", str(exc)))
 
-    def decode(self, latents_nchw) -> np.ndarray:
+    def decode(self, latents_nchw):
         """NCHW float32 → NHWC float32 [0, 1]."""
         self._req_q.put(np.asarray(latents_nchw, dtype=np.float32))
         tag, result = self._res_q.get(timeout=300)
