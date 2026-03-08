@@ -55,37 +55,37 @@ def safe_wandb_log(metrics, step=None):
 
 
 def load_vae(vae_model="stabilityai/sd-vae-ft-ema"):
-    """Load VAE weights directly in the main process.
+    """Load VAE using PyTorch AutoencoderKL (CPU).
 
-    Default model matches prepare_data_tpu.py which encodes latents with
-    stabilityai/sd-vae-ft-ema.  from_pt=True converts PyTorch weights to Flax
-    at load time (required for the stabilityai/* checkpoints which ship as PT).
+    FlaxAutoencoderKL is deprecated in Diffusers v1.0+ and triggers a
+    protobuf C-extension SIGSEGV on Kaggle TPU v5e at load time.
+    PyTorch CPU decode is crash-free and fast enough for small preview/FID
+    batches (vae_decode_batch_size default = 8).
 
-    Assumption: scaling_factor from vae.config is 0.18215 for this model,
-    consistent with the SCALE_FACTOR=0.18215 hardcoded in prepare_data_tpu.py.
+    stabilityai/sd-vae-ft-ema matches prepare_data_tpu.py; scaling_factor=0.18215.
     """
-    from diffusers import FlaxAutoencoderKL
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model, from_pt=True)
-    vae_params = jax.device_get(vae_params)
-    log_stage(f"VAE loaded: {vae_model!r} (scaling_factor={vae.config.scaling_factor})")
-    return vae, vae_params
+    import torch
+    from diffusers import AutoencoderKL
+    vae = AutoencoderKL.from_pretrained(vae_model, torch_dtype=torch.float32)
+    vae = vae.eval()
+    log_stage(f"VAE loaded: {vae_model!r} (PyTorch CPU, scaling_factor=0.18215)")
+    return vae
 
 
-def _make_vae_decode_fn(vae_module):
-    """Return a jitted decode function closed over vae_module.
+def decode_latents_pt(vae, latents_nchw):
+    """NCHW float32 latents → NHWC float32 [0, 1] via PyTorch CPU decode.
 
-    Input : NCHW bfloat16 latents (already on TPU)
-    Output: NHWC float32 images in [0, 1]
+    scaling_factor=0.18215 is hardcoded to match prepare_data_tpu.py and
+    stabilityai/sd-vae-ft-ema.  No JAX/Flax involvement — avoids protobuf
+    conflicts on TPU runtime.
     """
-    @jax.jit
-    def _decode(params, latents):
-        latents = latents.astype(jnp.bfloat16) / vae_module.config.scaling_factor
-        images = vae_module.apply(
-            {"params": params}, latents, method=vae_module.decode
-        ).sample
-        images = jnp.transpose(images, (0, 2, 3, 1))  # NCHW → NHWC
-        return jnp.clip((images + 1.0) / 2.0, 0.0, 1.0)
-    return _decode
+    import torch
+    with torch.no_grad():
+        t = torch.from_numpy(np.asarray(latents_nchw, dtype=np.float32)) / 0.18215
+        images = vae.decode(t).sample           # NCHW, range ≈ [-1, 1]
+        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
+        images = images.permute(0, 2, 3, 1)     # NCHW → NHWC
+    return images.numpy().astype(np.float32)
 
 
 def resolve_arrayrecord_paths(data_pattern):
@@ -968,22 +968,19 @@ def main():
             val_iterator = None
 
     # ── VAE: lazy init — only loaded when decode is first called ──────────────
-    # Keeps Diffusers/protobuf import out of the startup path so that runs
-    # without preview/FID/preflight never touch the VAE at all.
-    _vae_cache = [None]  # None until first use; then (vae_module, vae_params, decode_jit)
+    # PyTorch CPU decode; avoids FlaxAutoencoderKL protobuf SIGSEGV on TPU.
+    _vae_cache = [None]  # None until first use; then the loaded PyTorch vae module
 
     def ensure_vae_loaded():
         if _vae_cache[0] is None:
             log_stage(f"Loading VAE: {args.vae_model!r} (lazy, first decode call)…")
-            vae_module, vae_params = load_vae(args.vae_model)
-            _vae_cache[0] = (vae_module, vae_params, _make_vae_decode_fn(vae_module))
+            _vae_cache[0] = load_vae(args.vae_model)
         return _vae_cache[0]
 
     def decode_latents(latents_nchw):
-        """NCHW float32 → NHWC float32 [0, 1].  Runs on TPU via jit."""
-        _, vae_params, _vae_decode_jit = ensure_vae_loaded()
-        images = _vae_decode_jit(vae_params, jnp.asarray(latents_nchw))
-        return np.asarray(jax.device_get(images), dtype=np.float32)
+        """NCHW float32 → NHWC float32 [0, 1]. PyTorch CPU decode."""
+        vae = ensure_vae_loaded()
+        return decode_latents_pt(vae, latents_nchw)
 
     def decode_latents_batched(latents_nchw, decode_batch_size=None):
         """Decode latents in small chunks to avoid VAE OOM on TPU."""
