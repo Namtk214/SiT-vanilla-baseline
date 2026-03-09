@@ -187,7 +187,7 @@ class VAEDecodeSubprocess:
             self._proc.kill()
 
 
-def _build_flax_vae_decode_fn(vae_model_path, num_devices):
+def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabilityai/sd-vae-ft-ema"):
     """Load Flax VAE từ local path và build pmap'd decode function chạy trên TPU.
 
     Trả về (decode_fn, params_replicated) nếu thành công, hoặc (None, None) nếu
@@ -200,13 +200,22 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices):
     if not os.path.isdir(vae_model_path):
         return None, None  # HF repo ID: dùng subprocess như cũ
 
-    flax_msgpack = os.path.join(vae_model_path, "flax_model.msgpack")
-    zip_files = sorted(
-        os.path.join(vae_model_path, f)
-        for f in os.listdir(vae_model_path) if f.endswith(".zip")
+    dir_files = os.listdir(vae_model_path)
+    log_stage(f"[VAE-TPU] Scanning {vae_model_path}: {dir_files}")
+
+    standard_msgpack = os.path.join(vae_model_path, "flax_model.msgpack")
+    # Tìm bất kỳ *.msgpack nào (kể cả vae_params_bf16.msgpack)
+    all_msgpack = sorted(
+        os.path.join(vae_model_path, f) for f in dir_files if f.endswith(".msgpack")
     )
-    if not os.path.exists(flax_msgpack) and not zip_files:
-        return None, None  # PyTorch local dir: dùng subprocess như cũ
+    zip_files = sorted(
+        os.path.join(vae_model_path, f) for f in dir_files if f.endswith(".zip")
+    )
+    has_config = "config.json" in dir_files
+
+    if not all_msgpack and not zip_files:
+        log_stage("[VAE-TPU] Không tìm thấy .msgpack hay .zip, fallback về CPU subprocess.")
+        return None, None
 
     try:
         from diffusers.models import FlaxAutoencoderKL
@@ -215,12 +224,31 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices):
         log_stage(f"[VAE-TPU] diffusers/flax không có sẵn ({e}), fallback về CPU subprocess.")
         return None, None
 
-    if os.path.exists(flax_msgpack):
-        log_stage(f"[VAE-TPU] Loading Flax VAE từ {vae_model_path} (flax_model.msgpack)…")
-        vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_path)
+    # Config: ưu tiên local config.json, fallback về HF Hub (chỉ tải ~1KB)
+    def _get_vae_config():
+        if has_config:
+            return FlaxAutoencoderKL.load_config(vae_model_path)
+        log_stage(f"[VAE-TPU] Không có config.json local → tải từ HF: {hf_config_id}")
+        return FlaxAutoencoderKL.load_config(hf_config_id)
+
+    if all_msgpack:
+        # Standard HF format (config.json + flax_model.msgpack) → from_pretrained
+        if has_config and os.path.exists(standard_msgpack):
+            log_stage(f"[VAE-TPU] Loading từ {vae_model_path} (HF format)…")
+            vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_path)
+        else:
+            # Tên msgpack khác, ví dụ vae_params_bf16.msgpack
+            chosen = all_msgpack[0]
+            log_stage(f"[VAE-TPU] Loading params từ {os.path.basename(chosen)}…")
+            with open(chosen, "rb") as f:
+                params_bytes = f.read()
+            vae_params = flax.serialization.from_bytes(None, params_bytes)
+            vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
+            vae = FlaxAutoencoderKL.from_config(_get_vae_config())
     else:
-        log_stage(f"[VAE-TPU] Loading Flax VAE từ zip: {zip_files[0]}…")
-        with zipfile.ZipFile(zip_files[0], "r") as zf:
+        chosen_zip = zip_files[0]
+        log_stage(f"[VAE-TPU] Loading từ zip: {os.path.basename(chosen_zip)}…")
+        with zipfile.ZipFile(chosen_zip, "r") as zf:
             msgpack_name = next((n for n in zf.namelist() if n.endswith(".msgpack")), None)
             if msgpack_name is None:
                 log_stage("[VAE-TPU] Zip không chứa .msgpack, fallback về CPU subprocess.")
@@ -228,7 +256,7 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices):
             params_bytes = zf.read(msgpack_name)
         vae_params = flax.serialization.from_bytes(None, params_bytes)
         vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
-        vae = FlaxAutoencoderKL.from_config(FlaxAutoencoderKL.load_config(vae_model_path))
+        vae = FlaxAutoencoderKL.from_config(_get_vae_config())
 
     vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
 
@@ -1209,7 +1237,7 @@ def main():
 
     def _ensure_vae_backend():
         if _flax_decode_cache[0] is None:
-            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_devices)
+            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_devices, args.vae_hf_config)
             if decode_fn is not None:
                 _flax_decode_cache[0] = (decode_fn, params_repl)
             else:
