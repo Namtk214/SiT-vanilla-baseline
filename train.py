@@ -303,7 +303,8 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
         # Unscale rồi chuyển NCHW→NHWC vì Diffusers Flax VAE dùng NHWC
         latents_nhwc = jnp.transpose(latents_nchw / jnp.bfloat16(0.18215), (0, 2, 3, 1))
         images = vae.apply({"params": params}, latents_nhwc, method=vae.decode).sample
-        # [-1, 1] NHWC → [0, 1] float32
+        # Diffusers Flax VAE decode returns NCHW; transpose to NHWC for callers.
+        images = jnp.transpose(images, (0, 2, 3, 1))
         return ((images / 2.0 + 0.5).clip(0, 1)).astype(jnp.float32)
 
     from flax.jax_utils import replicate

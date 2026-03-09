@@ -183,6 +183,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         latents = jnp.transpose(latents, (0, 2, 3, 1))  # (B, H, W, C)
         
         images = vae.apply({"params": vae_params}, latents, method=vae.decode).sample
+        images = jnp.transpose(images, (0, 2, 3, 1))  # Diffusers Flax VAE decode returns NCHW
         images = (images + 1.0) / 2.0
         images = jnp.clip(images, 0.0, 1.0)
         
