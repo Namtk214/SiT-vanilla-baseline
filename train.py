@@ -742,7 +742,6 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
-        use_remat=False,
     )
 
     def sample_latents(params, class_labels, rng):
@@ -842,7 +841,6 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
-        use_remat=False,
     )
 
     patch_size = config["patch_size"]
