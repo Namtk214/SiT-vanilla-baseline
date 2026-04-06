@@ -243,6 +243,7 @@ class SelfFlowDiT(nn.Module):
     compatibility_mode: bool = False
     per_token: bool = False
     use_remat: bool = True
+    use_scan: bool = True
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -305,6 +306,7 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
+        # Determine base block class (with optional remat).
         if self.use_remat:
             BlockCls = nn.remat(
                 DiTBlock,
@@ -315,22 +317,72 @@ class SelfFlowDiT(nn.Module):
 
         zs = None
         block_summaries = [] if return_block_summaries else None
-        for i in range(self.depth):
-            x = BlockCls(
+
+        # use_scan compiles a single block and loops over it, dramatically
+        # reducing XLA compile-time HBM usage (O(1) graph instead of O(depth)).
+        # Block summaries / early feature extraction require the unrolled path.
+        use_scan_now = (
+            self.use_scan
+            and not return_block_summaries
+            and not return_features
+            and not return_raw_features
+        )
+
+        if use_scan_now:
+            # nn.scan expects __call__ to return (carry, output).
+            # We wrap BlockCls so it returns (x, token_mean) where token_mean
+            # is discarded here but keeps the interface clean.
+            class _ScanWrapper(nn.Module):
+                hidden_size: int
+                num_heads: int
+                mlp_ratio: float
+                per_token: bool
+
+                @nn.compact
+                def __call__(self, x, c_step):
+                    x = BlockCls(
+                        hidden_size=self.hidden_size,
+                        num_heads=self.num_heads,
+                        mlp_ratio=self.mlp_ratio,
+                        per_token=self.per_token,
+                    )(x, c_step)
+                    return x, None
+
+            ScannedBlock = nn.scan(
+                _ScanWrapper,
+                variable_axes={"params": 0},
+                variable_broadcast=False,
+                split_rngs={"params": True, "dropout": True},
+                length=self.depth,
+            )
+            # Tile c so each scan step receives one slice: (depth, *c.shape)
+            c_tiled = jnp.broadcast_to(
+                jnp.expand_dims(c, 0),
+                (self.depth,) + c.shape,
+            )
+            x, _ = ScannedBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
-                per_token=self.per_token
-            )(x, c)
+                per_token=self.per_token,
+            )(x, c_tiled)
+        else:
+            # Unrolled loop (needed for block summaries / feature extraction).
+            for i in range(self.depth):
+                x = BlockCls(
+                    hidden_size=self.hidden_size,
+                    num_heads=self.num_heads,
+                    mlp_ratio=self.mlp_ratio,
+                    per_token=self.per_token,
+                )(x, c)
 
-            if return_block_summaries:
-                # Token-pooled summary per block: (B, D)
-                block_summaries.append(jnp.mean(x, axis=1))
-            
-            if (i + 1) == return_features:
-                zs = self.feature_head(x)
-            elif (i + 1) == return_raw_features:
-                zs = x
+                if return_block_summaries:
+                    block_summaries.append(jnp.mean(x, axis=1))
+
+                if (i + 1) == return_features:
+                    zs = self.feature_head(x)
+                elif (i + 1) == return_raw_features:
+                    zs = x
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
