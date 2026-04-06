@@ -242,6 +242,7 @@ class SelfFlowDiT(nn.Module):
     learn_sigma: bool = False
     compatibility_mode: bool = False
     per_token: bool = False
+    use_remat: bool = True
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -304,12 +305,20 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
+        if self.use_remat:
+            BlockCls = nn.remat(
+                DiTBlock,
+                policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+            )
+        else:
+            BlockCls = DiTBlock
+
         zs = None
         block_summaries = [] if return_block_summaries else None
         for i in range(self.depth):
-            x = DiTBlock(
-                hidden_size=self.hidden_size, 
-                num_heads=self.num_heads, 
+            x = BlockCls(
+                hidden_size=self.hidden_size,
+                num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token
             )(x, c)
