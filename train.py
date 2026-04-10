@@ -522,21 +522,29 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred = state.apply_fn(
+        pred, mutables = state.apply_fn(
             {"params": params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=False,
             rngs={"dropout": drop_rng},
+            mutable=['intermediates'],
         )
         loss = jnp.mean((pred - target) ** 2)
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        return loss, (v_abs_mean, v_pred_abs_mean)
+        # Extract per-block activation magnitudes from intermediates
+        block_act_mags = mutables.get('intermediates', {}).get(
+            'block_act_magnitudes', [None]
+        )
+        # sow stores a tuple of values; take the last one
+        if isinstance(block_act_mags, tuple):
+            block_act_mags = block_act_mags[-1]
+        return loss, (v_abs_mean, v_pred_abs_mean, block_act_mags)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred, block_act_mags)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
@@ -557,6 +565,10 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
+    # Add per-block activation magnitudes
+    if block_act_mags is not None:
+        for i in range(block_act_mags.shape[0]):
+            metrics[f"training/activations/block_{i}"] = block_act_mags[i]
     return state, ema_params, metrics, rng
 
 
@@ -666,6 +678,178 @@ def next_validation_batch(val_iterator, data_pattern, batch_size):
             raise RuntimeError(
                 "Validation dataset yielded no full batches. Reduce --batch-size or add more validation samples."
             ) from exc
+
+
+# ── Online VAE encode helpers ─────────────────────────────────────────────────
+
+def patchify_latents_nchw(latents):
+    """Patchify NCHW latents to DiT input tokens.
+
+    Input:  (B, 4, 32, 32)  — NCHW latent from VAE encoder
+    Output: (B, 256, 16)    — same format as ArrayRecord dataloader output
+    """
+    latents = np.asarray(latents, dtype=np.float32)
+    B, C, H, W = latents.shape
+    p = 2
+    latents = latents.reshape(B, C, H // p, p, W // p, p)
+    latents = latents.transpose(0, 2, 4, 3, 5, 1)  # (B, H//p, W//p, p, p, C)
+    latents = latents.reshape(B, (H // p) * (W // p), p * p * C)
+    return latents
+
+
+def get_tfds_image_dataloader(data_dir, split, batch_size, shuffle=True, seed=42):
+    """Create a tf.data pipeline reading from TFDS (e.g. celebahq256).
+
+    Returns an iterator yielding (images_nchw, labels) as numpy arrays.
+    images_nchw: (B, 3, 256, 256) float32 in [-1, 1]
+    labels: (B,) int32
+    """
+    import tensorflow as tf
+    import tensorflow_datasets as tfds
+
+    # Load the TFDS dataset
+    ds = tfds.load(
+        'celebahq256',
+        data_dir=data_dir,
+        split=split,
+        as_supervised=False,
+        shuffle_files=shuffle,
+    )
+
+    def preprocess(example):
+        image = tf.cast(example['image'], tf.float32)
+        # Normalize to [-1, 1]
+        image = image / 127.5 - 1.0
+        # HWC -> CHW (NCHW convention for VAE)
+        image = tf.transpose(image, perm=[2, 0, 1])
+        label = tf.cast(example['label'], tf.int32)
+        return image, label
+
+    ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    if shuffle:
+        ds = ds.shuffle(buffer_size=min(10000, 28000), seed=seed)
+    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
+
+
+def create_tfds_data_iterator(data_dir, split, batch_size, shuffle=True):
+    """Create a repeating iterator from TFDS dataset."""
+    ds = get_tfds_image_dataloader(data_dir, split, batch_size, shuffle=shuffle)
+    # Repeat indefinitely for training
+    if shuffle:
+        ds = ds.repeat()
+    return iter(ds)
+
+
+def next_tfds_validation_batch(val_iterator, data_dir, batch_size):
+    """Get next validation batch from TFDS iterator, recreating if exhausted."""
+    try:
+        return next(val_iterator), val_iterator
+    except StopIteration:
+        val_iterator = create_tfds_data_iterator(
+            data_dir, 'validation', batch_size, shuffle=False
+        )
+        try:
+            return next(val_iterator), val_iterator
+        except StopIteration as exc:
+            raise RuntimeError(
+                "Validation dataset yielded no full batches. "
+                "Reduce --batch-size or add more validation samples."
+            ) from exc
+
+
+def _build_flax_vae_encode_fn(vae_model_id, num_devices):
+    """Load FlaxAutoencoderKL and build pmap'd encode function for TPU.
+
+    Returns (encode_fn, vae_params_replicated, vae, vae_params) if successful.
+    encode_fn signature:
+        (images_nchw_sharded, params_repl) → latents_nchw_sharded
+        images_nchw_sharded: (num_devices, batch_per_device, 3, 256, 256) bfloat16
+        latents_nchw_sharded: (num_devices, batch_per_device, 4, 32, 32) float32
+    """
+    if not _FLAX_VAE_AVAILABLE:
+        raise RuntimeError(
+            "FlaxAutoencoderKL is not available. "
+            "Install diffusers[flax]: pip install diffusers[flax]"
+        )
+
+    FlaxAutoencoderKL = _FlaxAutoencoderKL
+    log_stage(f"[VAE-ENCODE] Loading FlaxAutoencoderKL from {vae_model_id!r}…")
+
+    # Try loading: if local path has msgpack, load directly; otherwise from_pt
+    if os.path.isdir(vae_model_id):
+        dir_files = os.listdir(vae_model_id)
+        if 'flax_model.msgpack' in dir_files:
+            vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id)
+        else:
+            vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id, from_pt=True)
+    else:
+        # HuggingFace repo ID — download and convert from PyTorch
+        vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id, from_pt=True)
+
+    # Cast to bfloat16 for TPU efficiency
+    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
+
+    SCALE_FACTOR = 0.18215
+
+    @jax.pmap
+    def _encode_pmap(images_nchw, params):
+        # images_nchw: (batch_per_device, 3, 256, 256) bfloat16
+        # Diffusers Flax VAE with from_pt=True expects NCHW input
+        latent_dist = vae.apply({"params": params}, images_nchw, method=vae.encode).latent_dist
+        # Use mean for deterministic encoding (same as prepare_data_tpu.py)
+        latents_nhwc = latent_dist.mean * jnp.bfloat16(SCALE_FACTOR)
+        # Diffusers Flax outputs NHWC; transpose to NCHW
+        latents_nchw = jnp.transpose(latents_nhwc, (0, 3, 1, 2))
+        return latents_nchw.astype(jnp.float32)
+
+    from flax.jax_utils import replicate
+    vae_params_repl = replicate(vae_params)
+    log_stage(f"[VAE-ENCODE] Flax VAE encode ready on {num_devices} TPU device(s).")
+    return _encode_pmap, vae_params_repl
+
+
+def encode_images_to_latents(images_nchw, encode_fn, vae_params_repl, num_devices):
+    """Encode a batch of images to VAE latents on TPU.
+
+    Input:  images_nchw — (B, 3, 256, 256) numpy float32 [-1, 1]
+    Output: latents_nchw — (B, 4, 32, 32) numpy float32
+    """
+    images_nchw = np.asarray(images_nchw, dtype=np.float32)
+    n = images_nchw.shape[0]
+    # Pad to be divisible by num_devices
+    pad = (num_devices - n % num_devices) % num_devices
+    if pad > 0:
+        images_nchw = np.concatenate(
+            [images_nchw, np.zeros((pad, 3, 256, 256), dtype=np.float32)], axis=0
+        )
+    batch_per_device = images_nchw.shape[0] // num_devices
+    images_sharded = jnp.array(
+        images_nchw.reshape(num_devices, batch_per_device, 3, 256, 256),
+        dtype=jnp.bfloat16,
+    )
+    latents_sharded = encode_fn(images_sharded, vae_params_repl)
+    latents = jax.device_get(latents_sharded).reshape(-1, 4, 32, 32).astype(np.float32)
+    return latents[:n]
+
+
+def preprocess_batch_for_dit(images_nchw, labels, encode_fn, vae_params_repl, num_devices):
+    """Full preprocessing: encode images to latents, then patchify.
+
+    Input:
+        images_nchw: (B, 3, 256, 256) numpy float32 [-1, 1]
+        labels: (B,) numpy int32
+    Output:
+        tokens: (B, 256, 16) numpy float32 — patchified latents for DiT
+        labels: (B,) numpy int32
+        latents_nchw: (B, 4, 32, 32) numpy float32 — raw latents (for eval use)
+    """
+    latents_nchw = encode_images_to_latents(
+        images_nchw, encode_fn, vae_params_repl, num_devices
+    )
+    tokens = patchify_latents_nchw(latents_nchw)
+    return tokens, np.asarray(labels), latents_nchw
 
 
 def replicated_metrics_to_host(metrics):
@@ -1063,7 +1247,7 @@ def main():
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
-    parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
+    parser.add_argument("--data-path", type=str, default=None, help="Path/glob to training ArrayRecord files (for latent mode)")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
     parser.add_argument("--no-wandb", action="store_true")
@@ -1194,12 +1378,28 @@ def main():
                         help="Allow falling back to random mock batches when data is unavailable. "
                              "WARNING: mock batches are not suitable for real training. "
                              "Requires explicit opt-in to prevent silent failures.")
+    # ── Online VAE encode args ────────────────────────────────────────────────
+    parser.add_argument("--input-mode", type=str, default="latent", choices=["latent", "image"],
+                        help="Input mode: 'latent' reads pre-computed ArrayRecord latents (default); "
+                             "'image' reads RGB images from TFDS and encodes online via VAE.")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="TFDS data directory (for image mode). "
+                             "E.g. /home/ngothanhnam508/tensorflow_datasets")
+    parser.add_argument("--tfds-name", type=str, default="celebahq256",
+                        help="TFDS dataset name (default: celebahq256)")
+    parser.add_argument("--num-classes", type=int, default=None,
+                        help="Override num_classes in model config. "
+                             "Default: 1001 (ImageNet). For CelebAHQ256: 2.")
     args = parser.parse_args()
 
     if args.preflight_only:
         args.preflight_checks = True
 
     # ── Argument validation ───────────────────────────────────────────────────
+    if args.input_mode == "latent" and args.data_path is None:
+        raise ValueError("--data-path is required when --input-mode is 'latent'")
+    if args.input_mode == "image" and args.data_dir is None:
+        raise ValueError("--data-dir is required when --input-mode is 'image'")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if args.fid_freq > 0 and args.num_fid_samples <= 0:
@@ -1248,6 +1448,9 @@ def main():
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
+    if args.num_classes is not None:
+        config["num_classes"] = args.num_classes
+        log_stage(f"Overriding num_classes to {args.num_classes}")
     depth = int(config["depth"])
 
     log_stage(
@@ -1319,28 +1522,69 @@ def main():
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
+    input_mode = args.input_mode  # "latent" or "image"
     data_iterator = None
-    try:
-        dataloader = get_arrayrecord_dataloader(
-            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
-        )
-        data_iterator = iter(dataloader)
-    except Exception as e:
-        if args.mock_data:
-            log_stage(
-                f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
-                f"This is NOT suitable for real training; metrics will be meaningless. "
-                f"Error: {e}"
+    _vae_encode_cache = [None]  # (encode_fn, vae_params_repl) or None
+
+    if input_mode == "image":
+        # ── Image mode: TFDS dataloader + VAE encode on TPU ────────────────
+        log_stage(f"Input mode: IMAGE — loading TFDS '{args.tfds_name}' from {args.data_dir}")
+        try:
+            data_iterator = create_tfds_data_iterator(
+                args.data_dir, 'train', args.batch_size, shuffle=True
             )
-        else:
-            raise RuntimeError(
-                f"Failed to load training data from {args.data_path!r}: {e}\n"
-                "If you intentionally want to test with random mock batches (not real training), "
-                "add the --mock-data flag. Do NOT use mock batches for actual training runs."
-            ) from e
+        except Exception as e:
+            if args.mock_data:
+                log_stage(
+                    f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
+                    f"Error: {e}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to load TFDS training data from {args.data_dir!r}: {e}\n"
+                    "Add the --mock-data flag for testing with random mock batches."
+                ) from e
+
+        # Initialize VAE encode backend
+        log_stage("[VAE-ENCODE] Initializing VAE encoder for online encoding...")
+        vae_encode_fn, vae_encode_params_repl = _build_flax_vae_encode_fn(
+            args.vae_model, num_devices
+        )
+        _vae_encode_cache[0] = (vae_encode_fn, vae_encode_params_repl)
+        log_stage("[VAE-ENCODE] VAE encoder initialized successfully.")
+
+    else:
+        # ── Latent mode: ArrayRecord dataloader (original) ──────────────────
+        try:
+            dataloader = get_arrayrecord_dataloader(
+                data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+            )
+            data_iterator = iter(dataloader)
+        except Exception as e:
+            if args.mock_data:
+                log_stage(
+                    f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
+                    f"This is NOT suitable for real training; metrics will be meaningless. "
+                    f"Error: {e}"
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to load training data from {args.data_path!r}: {e}\n"
+                    "If you intentionally want to test with random mock batches (not real training), "
+                    "add the --mock-data flag. Do NOT use mock batches for actual training runs."
+                ) from e
 
     val_iterator = None
-    if args.val_data_path is not None:
+    if input_mode == "image":
+        # Image mode: TFDS validation
+        try:
+            val_iterator = create_tfds_data_iterator(
+                args.data_dir, 'validation', args.batch_size, shuffle=False
+            )
+        except Exception as e:
+            log_stage(f"Validation disabled (image mode). {e}")
+            val_iterator = None
+    elif args.val_data_path is not None:
         try:
             val_iterator = create_data_iterator(
                 data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False
@@ -1579,9 +1823,7 @@ def main():
             f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
             f"with VAE micro-batch {args.vae_decode_batch_size}..."
         )
-        probe_val_batch, val_data_iter = next_validation_batch(
-            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
-        )
+        probe_val_batch, val_data_iter = _get_next_val_batch(val_data_iter)
         real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
         real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
         extract_inception_features_host_images(
@@ -1619,6 +1861,29 @@ def main():
         return val_data_iter, cached_train_batch
 
     _eval_real_cache = [None]  # dict with pooled/spatial stats and metadata
+
+    def _get_next_val_batch(val_data_iter):
+        """Get next validation batch as (patchified_latents, labels) regardless of input mode.
+
+        Image mode: loads images → encode → patchify
+        Latent mode: loads pre-computed patchified latents (original behavior)
+        Returns (batch, updated_val_iter) where batch = (patchified_latents, labels).
+        """
+        if input_mode == "image":
+            raw_batch, val_data_iter = next_tfds_validation_batch(
+                val_data_iter, data_dir=args.data_dir, batch_size=args.batch_size,
+            )
+            v_images = np.asarray(raw_batch[0], dtype=np.float32)
+            v_labels = np.asarray(raw_batch[1], dtype=np.int32)
+            enc_fn, enc_params = _vae_encode_cache[0]
+            v_tokens, v_labels, _ = preprocess_batch_for_dit(
+                v_images, v_labels, enc_fn, enc_params, num_devices
+            )
+            return (v_tokens, v_labels), val_data_iter
+        else:
+            return next_validation_batch(
+                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size,
+            )
 
     def compute_eval_metrics(step, val_data_iter):
         """Hot-path eval for FID-bundled metrics (streaming, sharded, static shapes).
@@ -1660,9 +1925,7 @@ def main():
             pr_real_sampler = ReservoirSampler(pr_eval_samples, seed=0) if pr_enabled else None
             seen = 0
             while seen < need and current_val_iter is not None:
-                vbatch, current_val_iter = next_validation_batch(
-                    current_val_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
-                )
+                vbatch, current_val_iter = _get_next_val_batch(current_val_iter)
                 latents_all = unpatchify_patchified_latents(vbatch[0])  # (B,4,32,32) numpy
                 # Stream through this batch in fixed global_b chunks
                 for start in range(0, latents_all.shape[0], global_b):
@@ -1808,9 +2071,7 @@ def main():
             for i in range(int(args.probe_eval_batches)):
                 if probe_iter is None:
                     break
-                vbatch, probe_iter = next_validation_batch(
-                    probe_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
-                )
+                vbatch, probe_iter = _get_next_val_batch(probe_iter)
                 bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                 by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
                 corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
@@ -1843,9 +2104,7 @@ def main():
         bc_fn = get_blockcorr_pmapped()
         block_batches = []
         for i in range(int(args.block_corr_batches)):
-            vbatch, val_data_iter = next_validation_batch(
-                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
-            )
+            vbatch, val_data_iter = _get_next_val_batch(val_data_iter)
             bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
             by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
             summaries = bc_fn(ema_params, bx, by)
@@ -1869,13 +2128,23 @@ def main():
         inception_fn_for_preflight = get_inception("pooled+spatial") if args.preflight_fid_samples > 0 else None
         preflight_real_batch = None
         if val_iterator is not None:
-            preflight_batch, val_iterator = next_validation_batch(
-                val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
-            )
+            preflight_batch, val_iterator = _get_next_val_batch(val_iterator)
             preflight_real_batch = preflight_batch
         elif data_iterator is not None:
-            prefetched_train_batch = next(data_iterator)
-            preflight_real_batch = prefetched_train_batch
+            raw_train_batch = next(data_iterator)
+            if input_mode == "image":
+                # Convert to patchified format for preflight
+                t_images = np.asarray(raw_train_batch[0], dtype=np.float32)
+                t_labels = np.asarray(raw_train_batch[1], dtype=np.int32)
+                enc_fn, enc_params = _vae_encode_cache[0]
+                t_tokens, t_labels, _ = preprocess_batch_for_dit(
+                    t_images, t_labels, enc_fn, enc_params, num_devices
+                )
+                preflight_real_batch = (t_tokens, t_labels)
+                # Don't set prefetched_train_batch since we already consumed it
+            else:
+                prefetched_train_batch = raw_train_batch
+                preflight_real_batch = prefetched_train_batch
 
         rng = run_preflight_checks(
             state=state,
@@ -1919,15 +2188,28 @@ def main():
                     prefetched_train_batch = None
                 else:
                     batch = next(data_iterator)
-                batch_x = jnp.array(batch[0])
-                batch_y = jnp.array(batch[1])
+
+                if input_mode == "image":
+                    # Online VAE encode: images -> latents -> patchify
+                    images_nchw = np.asarray(batch[0], dtype=np.float32)
+                    labels = np.asarray(batch[1], dtype=np.int32)
+                    enc_fn, enc_params = _vae_encode_cache[0]
+                    tokens, labels, _ = preprocess_batch_for_dit(
+                        images_nchw, labels, enc_fn, enc_params, num_devices
+                    )
+                    batch_x = jnp.array(tokens)
+                    batch_y = jnp.array(labels)
+                else:
+                    # Latent mode: batch already contains patchified latents
+                    batch_x = jnp.array(batch[0])
+                    batch_y = jnp.array(batch[1])
             else:
                 # Mock fallback: only reaches here if --mock-data was explicitly set
                 rng_mock, = jax.random.split(rng[0], 1)
                 batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
 
-            # Reshape for SPMD: (Global, ...) → (Devices, Local, ...)
+            # Reshape for SPMD: (Global, ...) -> (Devices, Local, ...)
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
@@ -1954,11 +2236,25 @@ def main():
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
                 for _ in range(args.eval_batches):
-                    val_batch, val_iterator = next_validation_batch(
-                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
-                    )
-                    val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                    val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                    if input_mode == "image":
+                        val_batch, val_iterator = next_tfds_validation_batch(
+                            val_iterator, data_dir=args.data_dir, batch_size=args.batch_size,
+                        )
+                        # Encode + patchify for consistent format
+                        v_images = np.asarray(val_batch[0], dtype=np.float32)
+                        v_labels = np.asarray(val_batch[1], dtype=np.int32)
+                        enc_fn, enc_params = _vae_encode_cache[0]
+                        v_tokens, v_labels, _ = preprocess_batch_for_dit(
+                            v_images, v_labels, enc_fn, enc_params, num_devices
+                        )
+                        val_x = jnp.array(v_tokens).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                        val_y = jnp.array(v_labels).reshape(num_devices, local_batch_size)
+                    else:
+                        val_batch, val_iterator = next_validation_batch(
+                            val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                        )
+                        val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                        val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():

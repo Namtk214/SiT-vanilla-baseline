@@ -346,7 +346,9 @@ class SelfFlowDiT(nn.Module):
                         mlp_ratio=self.mlp_ratio,
                         per_token=self.per_token,
                     )(x, c_step)
-                    return x, None
+                    # Return per-block activation magnitude for monitoring
+                    act_mag = jnp.mean(jnp.abs(x))
+                    return x, act_mag
 
             ScannedBlock = nn.scan(
                 _ScanWrapper,
@@ -360,14 +362,17 @@ class SelfFlowDiT(nn.Module):
                 jnp.expand_dims(c, 0),
                 (self.depth,) + c.shape,
             )
-            x, _ = ScannedBlock(
+            x, block_act_mags = ScannedBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token,
             )(x, c_tiled)
+            # block_act_mags: (depth,) — mean |activation| per block
+            self.sow('intermediates', 'block_act_magnitudes', block_act_mags)
         else:
             # Unrolled loop (needed for block summaries / feature extraction).
+            _unrolled_act_mags = []
             for i in range(self.depth):
                 x = BlockCls(
                     hidden_size=self.hidden_size,
@@ -376,6 +381,8 @@ class SelfFlowDiT(nn.Module):
                     per_token=self.per_token,
                 )(x, c)
 
+                _unrolled_act_mags.append(jnp.mean(jnp.abs(x)))
+
                 if return_block_summaries:
                     block_summaries.append(jnp.mean(x, axis=1))
 
@@ -383,6 +390,9 @@ class SelfFlowDiT(nn.Module):
                     zs = self.feature_head(x)
                 elif (i + 1) == return_raw_features:
                     zs = x
+
+            self.sow('intermediates', 'block_act_magnitudes',
+                     jnp.stack(_unrolled_act_mags))
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
