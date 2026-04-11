@@ -384,9 +384,9 @@ def build_model_config(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
-        learn_sigma=True,
-        compatibility_mode=True,
+        num_classes=1000,
+        learn_sigma=False,
+        compatibility_mode=False,
     )
 
 
@@ -413,6 +413,9 @@ except ImportError:
     grain = None
 from src.model import SelfFlowDiT
 from src.sampling import denoise_loop
+from train_utils import sample_posterior_jax, patchify_latents_jax, patchify_latents_numpy, ema_update
+from train_stage1 import train_step_vaeloss
+from train_stage2 import train_step_selftrans
 from src.metrics import (
     ReservoirSampler,
     apply_inception_to_decoded_sharded,
@@ -449,6 +452,9 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        encoder_depth=config.get("encoder_depth", -1),  # -1 = disabled (vanilla SiT)
+        projector_dim=config.get("projector_dim", config["hidden_size"]),
+        dropout_prob=config.get("dropout_prob", 0.0),  # CFG dropout (use > 0 for Stage 2)
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -485,20 +491,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
 
 # ── Self-Flow core helpers ────────────────────────────────────────────────────
 
-def ema_update(ema_params, new_params, decay):
-    """Exponential moving average: ema = decay * ema + (1 - decay) * new.
-
-    Paper-faithful: EMA decay = 0.9999 by default.
-    Called after each gradient step inside train_step.
-    """
-    return jax.tree_util.tree_map(
-        lambda ema, new: decay * ema + (1.0 - decay) * new,
-        ema_params,
-        new_params,
-    )
-
-
 # ── Vanilla SiT training/eval ─────────────────────────────────────────────────
+# NOTE: ema_update, sample_posterior_jax, patchify_latents_jax moved to train_utils.py
 
 def train_step(
     state, ema_params, batch, rng, ema_decay,
@@ -522,29 +516,21 @@ def train_step(
     target = x0 - x1
 
     def loss_fn(params):
-        pred, mutables = state.apply_fn(
+        pred = state.apply_fn(
             {"params": params},
             x_tau,
             timesteps=tau,
             vector=y,
             deterministic=False,
             rngs={"dropout": drop_rng},
-            mutable=['intermediates'],
         )
         loss = jnp.mean((pred - target) ** 2)
         v_abs_mean = jnp.mean(jnp.abs(target))
         v_pred_abs_mean = jnp.mean(jnp.abs(pred))
-        # Extract per-block activation magnitudes from intermediates
-        block_act_mags = mutables.get('intermediates', {}).get(
-            'block_act_magnitudes', [None]
-        )
-        # sow stores a tuple of values; take the last one
-        if isinstance(block_act_mags, tuple):
-            block_act_mags = block_act_mags[-1]
-        return loss, (v_abs_mean, v_pred_abs_mean, block_act_mags)
+        return loss, (v_abs_mean, v_pred_abs_mean)
 
     grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    (loss, (v_abs, v_pred, block_act_mags)), grads = grad_fn(state.params)
+    (loss, (v_abs, v_pred)), grads = grad_fn(state.params)
 
     loss = jax.lax.pmean(loss, axis_name="batch")
     v_abs = jax.lax.pmean(v_abs, axis_name="batch")
@@ -565,10 +551,6 @@ def train_step(
         "train/v_abs_mean": v_abs,
         "train/v_pred_abs_mean": v_pred,
     }
-    # Add per-block activation magnitudes
-    if block_act_mags is not None:
-        for i in range(block_act_mags.shape[0]):
-            metrics[f"training/activations/block_{i}"] = block_act_mags[i]
     return state, ema_params, metrics, rng
 
 
@@ -610,6 +592,11 @@ def eval_step(
     return metrics, rng
 
 
+# ── Self-Transcendence Training Steps ────────────────────────────────────────
+# NOTE: train_step_vaeloss (Stage 1) moved to train_stage1.py
+# NOTE: train_step_selftrans (Stage 2) moved to train_stage2.py
+
+
 def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=42):
     """
     Creates an optimized Grain dataloader reading from ArrayRecord files.
@@ -622,22 +609,23 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
     data_source = grain.ArrayRecordDataSource(input_paths)
 
     class ParseAndTokenizeLatents(grain.MapTransform):
+        """Parse data from ArrayRecord.
+
+        Returns raw moments (8, H, W) or latents (4, H, W) without patchifying.
+        Patchifying happens later in train step after sampling (for moments)
+        or in batch preparation (for latents).
+        """
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
 
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
+            # Read moments if available, otherwise fall back to latent
+            if "moments" in parsed:
+                data = parsed["moments"]  # numpy array shape: (8, 32, 32)
+            else:
+                data = parsed["latent"]  # numpy array shape: (4, 32, 32)
+
             label = parsed["label"]
-
-            # Patchify the latent to DiT input (256, 16)
-            c, h, w = latent.shape
-            p = 2
-
-            # Using numpy to manipulate shapes to send cleanly into DataLoader
-            latent = np.reshape(latent, (c, h // p, p, w // p, p))
-            latent = np.transpose(latent, (1, 3, 2, 4, 0)) # block arrangement
-            latent = np.reshape(latent, ((h // p) * (w // p), p * p * c))
-
-            return latent, label
+            return data, label
 
     operations = [
         ParseAndTokenizeLatents(),
@@ -678,178 +666,6 @@ def next_validation_batch(val_iterator, data_pattern, batch_size):
             raise RuntimeError(
                 "Validation dataset yielded no full batches. Reduce --batch-size or add more validation samples."
             ) from exc
-
-
-# ── Online VAE encode helpers ─────────────────────────────────────────────────
-
-def patchify_latents_nchw(latents):
-    """Patchify NCHW latents to DiT input tokens.
-
-    Input:  (B, 4, 32, 32)  — NCHW latent from VAE encoder
-    Output: (B, 256, 16)    — same format as ArrayRecord dataloader output
-    """
-    latents = np.asarray(latents, dtype=np.float32)
-    B, C, H, W = latents.shape
-    p = 2
-    latents = latents.reshape(B, C, H // p, p, W // p, p)
-    latents = latents.transpose(0, 2, 4, 3, 5, 1)  # (B, H//p, W//p, p, p, C)
-    latents = latents.reshape(B, (H // p) * (W // p), p * p * C)
-    return latents
-
-
-def get_tfds_image_dataloader(data_dir, split, batch_size, shuffle=True, seed=42):
-    """Create a tf.data pipeline reading from TFDS (e.g. celebahq256).
-
-    Returns an iterator yielding (images_nchw, labels) as numpy arrays.
-    images_nchw: (B, 3, 256, 256) float32 in [-1, 1]
-    labels: (B,) int32
-    """
-    import tensorflow as tf
-    import tensorflow_datasets as tfds
-
-    # Load the TFDS dataset
-    ds = tfds.load(
-        'celebahq256',
-        data_dir=data_dir,
-        split=split,
-        as_supervised=False,
-        shuffle_files=shuffle,
-    )
-
-    def preprocess(example):
-        image = tf.cast(example['image'], tf.float32)
-        # Normalize to [-1, 1]
-        image = image / 127.5 - 1.0
-        # HWC -> CHW (NCHW convention for VAE)
-        image = tf.transpose(image, perm=[2, 0, 1])
-        label = tf.cast(example['label'], tf.int32)
-        return image, label
-
-    ds = ds.map(preprocess, num_parallel_calls=tf.data.AUTOTUNE)
-    if shuffle:
-        ds = ds.shuffle(buffer_size=min(10000, 28000), seed=seed)
-    ds = ds.batch(batch_size, drop_remainder=True)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
-    return ds
-
-
-def create_tfds_data_iterator(data_dir, split, batch_size, shuffle=True):
-    """Create a repeating iterator from TFDS dataset."""
-    ds = get_tfds_image_dataloader(data_dir, split, batch_size, shuffle=shuffle)
-    # Repeat indefinitely for training
-    if shuffle:
-        ds = ds.repeat()
-    return iter(ds)
-
-
-def next_tfds_validation_batch(val_iterator, data_dir, batch_size):
-    """Get next validation batch from TFDS iterator, recreating if exhausted."""
-    try:
-        return next(val_iterator), val_iterator
-    except StopIteration:
-        val_iterator = create_tfds_data_iterator(
-            data_dir, 'validation', batch_size, shuffle=False
-        )
-        try:
-            return next(val_iterator), val_iterator
-        except StopIteration as exc:
-            raise RuntimeError(
-                "Validation dataset yielded no full batches. "
-                "Reduce --batch-size or add more validation samples."
-            ) from exc
-
-
-def _build_flax_vae_encode_fn(vae_model_id, num_devices):
-    """Load FlaxAutoencoderKL and build pmap'd encode function for TPU.
-
-    Returns (encode_fn, vae_params_replicated, vae, vae_params) if successful.
-    encode_fn signature:
-        (images_nchw_sharded, params_repl) → latents_nchw_sharded
-        images_nchw_sharded: (num_devices, batch_per_device, 3, 256, 256) bfloat16
-        latents_nchw_sharded: (num_devices, batch_per_device, 4, 32, 32) float32
-    """
-    if not _FLAX_VAE_AVAILABLE:
-        raise RuntimeError(
-            "FlaxAutoencoderKL is not available. "
-            "Install diffusers[flax]: pip install diffusers[flax]"
-        )
-
-    FlaxAutoencoderKL = _FlaxAutoencoderKL
-    log_stage(f"[VAE-ENCODE] Loading FlaxAutoencoderKL from {vae_model_id!r}…")
-
-    # Try loading: if local path has msgpack, load directly; otherwise from_pt
-    if os.path.isdir(vae_model_id):
-        dir_files = os.listdir(vae_model_id)
-        if 'flax_model.msgpack' in dir_files:
-            vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id)
-        else:
-            vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id, from_pt=True)
-    else:
-        # HuggingFace repo ID — download and convert from PyTorch
-        vae, vae_params = FlaxAutoencoderKL.from_pretrained(vae_model_id, from_pt=True)
-
-    # Cast to bfloat16 for TPU efficiency
-    vae_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), vae_params)
-
-    SCALE_FACTOR = 0.18215
-
-    @jax.pmap
-    def _encode_pmap(images_nchw, params):
-        # images_nchw: (batch_per_device, 3, 256, 256) bfloat16
-        # Diffusers Flax VAE with from_pt=True expects NCHW input
-        latent_dist = vae.apply({"params": params}, images_nchw, method=vae.encode).latent_dist
-        # Use mean for deterministic encoding (same as prepare_data_tpu.py)
-        latents_nhwc = latent_dist.mean * jnp.bfloat16(SCALE_FACTOR)
-        # Diffusers Flax outputs NHWC; transpose to NCHW
-        latents_nchw = jnp.transpose(latents_nhwc, (0, 3, 1, 2))
-        return latents_nchw.astype(jnp.float32)
-
-    from flax.jax_utils import replicate
-    vae_params_repl = replicate(vae_params)
-    log_stage(f"[VAE-ENCODE] Flax VAE encode ready on {num_devices} TPU device(s).")
-    return _encode_pmap, vae_params_repl
-
-
-def encode_images_to_latents(images_nchw, encode_fn, vae_params_repl, num_devices):
-    """Encode a batch of images to VAE latents on TPU.
-
-    Input:  images_nchw — (B, 3, 256, 256) numpy float32 [-1, 1]
-    Output: latents_nchw — (B, 4, 32, 32) numpy float32
-    """
-    images_nchw = np.asarray(images_nchw, dtype=np.float32)
-    n = images_nchw.shape[0]
-    # Pad to be divisible by num_devices
-    pad = (num_devices - n % num_devices) % num_devices
-    if pad > 0:
-        images_nchw = np.concatenate(
-            [images_nchw, np.zeros((pad, 3, 256, 256), dtype=np.float32)], axis=0
-        )
-    batch_per_device = images_nchw.shape[0] // num_devices
-    images_sharded = jnp.array(
-        images_nchw.reshape(num_devices, batch_per_device, 3, 256, 256),
-        dtype=jnp.bfloat16,
-    )
-    latents_sharded = encode_fn(images_sharded, vae_params_repl)
-    latents = jax.device_get(latents_sharded).reshape(-1, 4, 32, 32).astype(np.float32)
-    return latents[:n]
-
-
-def preprocess_batch_for_dit(images_nchw, labels, encode_fn, vae_params_repl, num_devices):
-    """Full preprocessing: encode images to latents, then patchify.
-
-    Input:
-        images_nchw: (B, 3, 256, 256) numpy float32 [-1, 1]
-        labels: (B,) numpy int32
-    Output:
-        tokens: (B, 256, 16) numpy float32 — patchified latents for DiT
-        labels: (B,) numpy int32
-        latents_nchw: (B, 4, 32, 32) numpy float32 — raw latents (for eval use)
-    """
-    latents_nchw = encode_images_to_latents(
-        images_nchw, encode_fn, vae_params_repl, num_devices
-    )
-    tokens = patchify_latents_nchw(latents_nchw)
-    return tokens, np.asarray(labels), latents_nchw
 
 
 def replicated_metrics_to_host(metrics):
@@ -912,8 +728,14 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     different eval modes:
       - Fast TPU monitoring default: num_steps=50, cfg_scale=1.0
       - Paper-like eval: num_steps=250, cfg_scale=1.0
-        (CFG training not implemented; cfg_scale > 1.0 is not paper-comparable)
+        (CFG > 1.0 only works for checkpoints trained with dropout_prob > 0)
     """
+    if cfg_scale > 1.0 and config.get("dropout_prob", 0.0) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires a checkpoint/model config with dropout_prob > 0 "
+            "(Self-Trans style classifier-free training)."
+        )
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -926,6 +748,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        dropout_prob=config.get("dropout_prob", 0.0),
     )
 
     def sample_latents(params, class_labels, rng):
@@ -959,7 +782,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels = jnp.concatenate(
-                [jnp.full_like(class_labels, config["num_classes"] - 1), class_labels],
+                [jnp.full_like(class_labels, config["num_classes"]), class_labels],
                 axis=0,
             )
 
@@ -1013,6 +836,12 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         rng_sharded: (devices, 2) PRNGKey
       -> latents_sharded: (devices, local_batch, 4, 32, 32) float32
     """
+    if cfg_scale > 1.0 and config.get("dropout_prob", 0.0) <= 0.0:
+        raise ValueError(
+            "CFG sampling requires a checkpoint/model config with dropout_prob > 0 "
+            "(Self-Trans style classifier-free training)."
+        )
+
     model = SelfFlowDiT(
         input_size=config["input_size"],
         patch_size=config["patch_size"],
@@ -1025,6 +854,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        dropout_prob=config.get("dropout_prob", 0.0),
     )
 
     patch_size = config["patch_size"]
@@ -1054,7 +884,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
             class_labels_local = jnp.concatenate(
-                [jnp.full_like(class_labels_local, config["num_classes"] - 1), class_labels_local],
+                [jnp.full_like(class_labels_local, config["num_classes"]), class_labels_local],
                 axis=0,
             )
 
@@ -1247,7 +1077,7 @@ def main():
     parser.add_argument("--steps-per-epoch", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
-    parser.add_argument("--data-path", type=str, default=None, help="Path/glob to training ArrayRecord files (for latent mode)")
+    parser.add_argument("--data-path", type=str, required=True, help="Path/glob to training ArrayRecord files")
     parser.add_argument("--val-data-path", type=str, default=None)
     parser.add_argument("--wandb-project", type=str, default="sit-vanilla-jax")
     parser.add_argument("--no-wandb", action="store_true")
@@ -1261,6 +1091,64 @@ def main():
     )
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient clip max_norm (paper: 1.0)")
+    # ── Self-Transcendence args ───────────────────────────────────────────────
+    parser.add_argument(
+        "--stage",
+        type=str,
+        default="vanilla",
+        choices=["vanilla", "stage1", "stage2"],
+        help="Training stage: vanilla (baseline SiT), stage1 (VAE structure guidance), stage2 (self-guided representation)",
+    )
+    parser.add_argument(
+        "--proj-coeff",
+        type=float,
+        default=0.5,
+        help="Coefficient for auxiliary loss (stage1: lambda_vae, stage2: lambda_self)",
+    )
+    parser.add_argument(
+        "--t-range",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("T_MIN", "T_MAX"),
+        help="Optional timestep range [t_min, t_max] for applying auxiliary loss. Default: None (all timesteps)",
+    )
+    parser.add_argument(
+        "--encoder-depth",
+        type=int,
+        default=8,
+        help="Block depth to extract auxiliary features for Stage 1 VAE guidance",
+    )
+    parser.add_argument(
+        "--stu-depth",
+        type=int,
+        default=8,
+        help="Student feature extraction depth for Stage 2",
+    )
+    parser.add_argument(
+        "--tea-depth",
+        type=int,
+        default=2,
+        help="Teacher feature extraction depth for Stage 2",
+    )
+    parser.add_argument(
+        "--cfg-guide",
+        type=float,
+        default=5.0,
+        help="CFG scale for teacher features in Stage 2",
+    )
+    parser.add_argument(
+        "--cfg-prob",
+        type=float,
+        default=0.1,
+        help="Classifier-free guidance dropout probability during training",
+    )
+    parser.add_argument(
+        "--ckpt-guided-model",
+        type=str,
+        default=None,
+        help="Path to Stage 1 checkpoint for loading frozen teacher in Stage 2. Required when --stage=stage2.",
+    )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
         "--vae-model",
@@ -1297,8 +1185,7 @@ def main():
                         help="Denoising steps for sample previews. "
                              "TPU-friendly default: 50. Paper-like eval: 250.")
     parser.add_argument("--sample-cfg-scale", type=float, default=1.0,
-                        help="CFG scale for sample previews. Default 1.0 (no CFG; "
-                             "classifier-free training not implemented).")
+                        help="CFG scale for sample previews. Default 1.0 (no CFG).")
     # ── FID args (TPU-friendly defaults; not paper-comparable at defaults) ────
     parser.add_argument("--fid-freq", type=int, default=10000,
                         help="Run FID every N steps (0 disables). "
@@ -1366,6 +1253,19 @@ def main():
     parser.add_argument("--vae-decode-batch-size", type=int, default=8,
                         help="Micro-batch size for VAE decode during previews/FID/preflight. "
                              "Lower this on 16GB TPU if decode OOMs.")
+    # ── PCA visualization args ────────────────────────────────────────────────
+    parser.add_argument("--pca-freq", type=int, default=0,
+                        help="Cadence (steps) for PCA feature visualization. 0 disables.")
+    parser.add_argument("--pca-layers", type=str, default="8,16",
+                        help="Comma-separated layer indices for PCA visualization (e.g., '8,16')")
+    parser.add_argument("--pca-tau", type=float, default=0.6,
+                        help="Fixed timestep tau for PCA visualization (default: 0.6)")
+    parser.add_argument("--pca-num-samples", type=int, default=4,
+                        help="Number of samples from probe batch to visualize with PCA")
+    parser.add_argument("--pca-resize", type=int, default=256,
+                        help="Output image size for PCA visualization (resized from token grid)")
+    parser.add_argument("--pca-use-ema", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use EMA params for PCA visualization (more stable)")
     # ── Preflight / safety args ───────────────────────────────────────────────
     parser.add_argument("--preflight-checks", action="store_true")
     parser.add_argument("--preflight-only", action="store_true")
@@ -1378,28 +1278,12 @@ def main():
                         help="Allow falling back to random mock batches when data is unavailable. "
                              "WARNING: mock batches are not suitable for real training. "
                              "Requires explicit opt-in to prevent silent failures.")
-    # ── Online VAE encode args ────────────────────────────────────────────────
-    parser.add_argument("--input-mode", type=str, default="latent", choices=["latent", "image"],
-                        help="Input mode: 'latent' reads pre-computed ArrayRecord latents (default); "
-                             "'image' reads RGB images from TFDS and encodes online via VAE.")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="TFDS data directory (for image mode). "
-                             "E.g. /home/ngothanhnam508/tensorflow_datasets")
-    parser.add_argument("--tfds-name", type=str, default="celebahq256",
-                        help="TFDS dataset name (default: celebahq256)")
-    parser.add_argument("--num-classes", type=int, default=None,
-                        help="Override num_classes in model config. "
-                             "Default: 1001 (ImageNet). For CelebAHQ256: 2.")
     args = parser.parse_args()
 
     if args.preflight_only:
         args.preflight_checks = True
 
     # ── Argument validation ───────────────────────────────────────────────────
-    if args.input_mode == "latent" and args.data_path is None:
-        raise ValueError("--data-path is required when --input-mode is 'latent'")
-    if args.input_mode == "image" and args.data_dir is None:
-        raise ValueError("--data-dir is required when --input-mode is 'image'")
     if args.eval_batches <= 0:
         raise ValueError("--eval-batches must be greater than 0")
     if args.fid_freq > 0 and args.num_fid_samples <= 0:
@@ -1422,14 +1306,35 @@ def main():
         raise ValueError("--block-corr-freq must be >= 0")
     if args.block_corr_batches <= 0:
         raise ValueError("--block-corr-batches must be > 0")
+    if args.pca_freq < 0:
+        raise ValueError("--pca-freq must be >= 0")
+    if args.pca_num_samples <= 0:
+        raise ValueError("--pca-num-samples must be > 0")
+    if args.pca_resize <= 0:
+        raise ValueError("--pca-resize must be > 0")
+    if not (0.0 <= args.pca_tau <= 1.0):
+        raise ValueError("--pca-tau must be in [0, 1]")
     if args.vae_decode_batch_size <= 0:
         raise ValueError("--vae-decode-batch-size must be greater than 0")
 
-    # ── Device initialisation ─────────────────────────────────────────────────
+    # Self-Transcendence validation
+    if args.stage == "stage2" and args.ckpt_guided_model is None:
+        raise ValueError("--stage=stage2 requires --ckpt-guided-model (path to Stage 1 checkpoint)")
+    if args.stage == "stage1" and args.encoder_depth <= 0:
+        raise ValueError("--stage=stage1 requires --encoder-depth > 0")
+    if args.t_range is not None and (
+        args.t_range[0] < 0.0 or args.t_range[1] > 1.0 or args.t_range[0] >= args.t_range[1]
+    ):
+        raise ValueError("--t-range must be [t_min, t_max] where 0 <= t_min < t_max <= 1")
+
+    # ── Multi-worker TPU initialization ───────────────────────────────────────
     _tpu_init_attempts = 3
     for _attempt in range(_tpu_init_attempts):
         try:
-            num_devices = jax.device_count()
+            num_local_devices = jax.local_device_count()  # Devices in this process
+            num_devices = jax.device_count()              # Total devices across all processes
+            num_processes = jax.process_count()           # Number of workers/processes
+            process_index = jax.process_index()           # Current worker ID (0-indexed)
             break
         except Exception as exc:
             if _attempt < _tpu_init_attempts - 1 and "busy" in str(exc).lower():
@@ -1441,32 +1346,79 @@ def main():
                     "Hint: run `sudo pkill -9 -f train.py && sleep 3` in the notebook to release the TPU lock."
                 ) from exc
 
+    # Validate batch size for multi-worker setup
+    # Global batch size must be divisible by total number of devices across all workers
     if args.batch_size % num_devices != 0:
-        raise ValueError(f"--batch-size ({args.batch_size}) must be divisible by device count ({num_devices})")
+        raise ValueError(
+            f"--batch-size ({args.batch_size}) must be divisible by total device count ({num_devices}). "
+            f"You have {num_processes} workers × {num_local_devices} devices/worker = {num_devices} total devices."
+        )
+
+    # Each worker processes: global_batch / num_devices per device
     local_batch_size = args.batch_size // num_devices
-    log_stage(f"TPU Cores: {num_devices}. Global Batch: {args.batch_size}, Local Batch: {local_batch_size}")
+    per_worker_batch = local_batch_size * num_local_devices
+
+    log_stage(
+        f"Multi-Worker Setup: Process {process_index}/{num_processes}, "
+        f"Local Devices: {num_local_devices}, Total Devices: {num_devices}"
+    )
+    log_stage(
+        f"Batch Distribution: Global={args.batch_size}, "
+        f"PerWorker={per_worker_batch}, PerDevice={local_batch_size}"
+    )
+
+    # Coordinator flag: only process 0 should save checkpoints and log to WandB
+    is_coordinator = process_index == 0
 
     # ── Model config ─────────────────────────────────────────────────────────
     config = build_model_config(args.model_size)
-    if args.num_classes is not None:
-        config["num_classes"] = args.num_classes
-        log_stage(f"Overriding num_classes to {args.num_classes}")
     depth = int(config["depth"])
+
+    # Add Self-Transcendence parameters to config
+    if args.stage == "stage1":
+        config["encoder_depth"] = args.encoder_depth
+        config["projector_dim"] = config["hidden_size"]
+        config["dropout_prob"] = args.cfg_prob
+    elif args.stage == "stage2":
+        config["encoder_depth"] = -1  # Disable auxiliary head for stage 2
+        config["projector_dim"] = config["hidden_size"]
+        config["dropout_prob"] = args.cfg_prob  # Enable CFG dropout for stage 2
+    else:  # vanilla
+        config["encoder_depth"] = -1
+        config["projector_dim"] = config["hidden_size"]
+        config["dropout_prob"] = 0.0
 
     log_stage(
         f"Model=DiT-{args.model_size.upper()} hidden={config['hidden_size']} "
         f"depth={depth} heads={config['num_heads']}"
     )
     log_stage(
-        f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
+        f"Training stage={args.stage} ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    if args.stage in ["stage1", "stage2"]:
+        log_stage(
+            f"Self-Transcendence: proj_coeff={args.proj_coeff} t_range={args.t_range}"
+        )
+        if args.stage == "stage1":
+            log_stage(f"Stage 1: encoder_depth={args.encoder_depth}")
+        else:
+            log_stage(
+                f"Stage 2: stu_depth={args.stu_depth} tea_depth={args.tea_depth} "
+                f"cfg_guide={args.cfg_guide} cfg_prob={args.cfg_prob}"
+            )
 
-    # ── WandB ─────────────────────────────────────────────────────────────────
-    if not args.no_wandb:
+    # ── WandB (only coordinator should log) ───────────────────────────────────
+    # In multi-worker training, only process 0 should init WandB to avoid duplicate logging
+    if not args.no_wandb and is_coordinator:
         wandb.init(project=args.wandb_project, config=vars(args))
         wandb.define_metric("train/step")
         wandb.define_metric("*", step_metric="train/step")
-    logger = AsyncWandbLogger(enabled=not args.no_wandb)
+        log_stage("WandB initialized (coordinator process only)")
+    elif not args.no_wandb:
+        log_stage(f"WandB logging delegated to coordinator (this is worker {process_index})")
+
+    # Logger only active on coordinator
+    logger = AsyncWandbLogger(enabled=(not args.no_wandb and is_coordinator))
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
@@ -1497,8 +1449,93 @@ def main():
     flops_per_train_step = estimate_train_step_flops(config, args.batch_size, n_patches)
     accumulated_train_tflops = 0.0
 
+    # ── Stage 2: Load guided model (teacher from Stage 1) ────────────────────
+    guided_model_fn = None
+    guided_params_repl = None
+    if args.stage == "stage2":
+        log_stage(f"Loading guided model from {args.ckpt_guided_model} for Stage 2...")
+
+        # Build guided model config (same as current model but with stage 1 settings)
+        guided_config = build_model_config(args.model_size)
+        guided_config["encoder_depth"] = args.encoder_depth  # Use stage 1 encoder depth
+        guided_config["projector_dim"] = guided_config["hidden_size"]
+        guided_config["dropout_prob"] = args.cfg_prob
+
+        # Create guided model
+        guided_model = SelfFlowDiT(
+            input_size=guided_config["input_size"],
+            patch_size=guided_config["patch_size"],
+            in_channels=guided_config["in_channels"],
+            hidden_size=guided_config["hidden_size"],
+            depth=guided_config["depth"],
+            num_heads=guided_config["num_heads"],
+            mlp_ratio=guided_config["mlp_ratio"],
+            num_classes=guided_config["num_classes"],
+            learn_sigma=guided_config["learn_sigma"],
+            compatibility_mode=guided_config["compatibility_mode"],
+            per_token=False,
+            encoder_depth=guided_config["encoder_depth"],
+            projector_dim=guided_config["projector_dim"],
+            dropout_prob=guided_config["dropout_prob"],
+        )
+
+        # Initialize guided model to get structure
+        rng_guided = jax.random.PRNGKey(43)
+        dummy_x = jnp.ones((1, n_patches, patch_dim))
+        dummy_t = jnp.ones((1,))
+        dummy_vec = jnp.ones((1,), dtype=jnp.int32)
+        rng_guided, drop_rng_guided = jax.random.split(rng_guided)
+        guided_variables = guided_model.init(
+            {'params': rng_guided, 'dropout': drop_rng_guided},
+            x=dummy_x,
+            timesteps=dummy_t,
+            vector=dummy_vec,
+            deterministic=True,
+        )
+
+        # Load checkpoint
+        guided_params = checkpoints.restore_checkpoint(
+            args.ckpt_guided_model,
+            target=guided_variables['params'],
+            prefix="checkpoint_",
+        )
+
+        # Replicate across devices
+        guided_params_repl = jax_utils.replicate(guided_params)
+        guided_model_fn = guided_model.apply
+
+        log_stage(f"Guided model loaded successfully. Frozen for Stage 2 training.")
+
     # ── Build pmapped training/eval steps ────────────────────────────────────
-    pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    # Dispatch train step based on stage
+    if args.stage == "vanilla":
+        log_stage("Using vanilla SiT training step")
+        pmapped_train_step = jax.pmap(train_step, axis_name="batch")
+    elif args.stage == "stage1":
+        log_stage(f"Using Stage 1 (VAE guidance) training step")
+        # Partial application of hyperparameters
+        def train_step_stage1_partial(state, ema_params, batch, rng, ema_decay):
+            return train_step_vaeloss(
+                state, ema_params, batch, rng, ema_decay,
+                proj_coeff=args.proj_coeff,
+                t_range=tuple(args.t_range) if args.t_range is not None else None,
+            )
+        pmapped_train_step = jax.pmap(train_step_stage1_partial, axis_name="batch")
+    elif args.stage == "stage2":
+        log_stage(f"Using Stage 2 (self-guided representation) training step")
+        # Partial application with guided model
+        def train_step_stage2_partial(state, ema_params, batch, rng, ema_decay):
+            return train_step_selftrans(
+                state, ema_params, guided_model_fn, guided_params_repl, batch, rng, ema_decay,
+                proj_coeff=args.proj_coeff,
+                t_range=tuple(args.t_range) if args.t_range is not None else None,
+                stu_depth=args.stu_depth,
+                tea_depth=args.tea_depth,
+                cfg_guide=args.cfg_guide,
+                num_classes=config["num_classes"],
+            )
+        pmapped_train_step = jax.pmap(train_step_stage2_partial, axis_name="batch")
+
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
@@ -1522,69 +1559,28 @@ def main():
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
-    input_mode = args.input_mode  # "latent" or "image"
     data_iterator = None
-    _vae_encode_cache = [None]  # (encode_fn, vae_params_repl) or None
-
-    if input_mode == "image":
-        # ── Image mode: TFDS dataloader + VAE encode on TPU ────────────────
-        log_stage(f"Input mode: IMAGE — loading TFDS '{args.tfds_name}' from {args.data_dir}")
-        try:
-            data_iterator = create_tfds_data_iterator(
-                args.data_dir, 'train', args.batch_size, shuffle=True
-            )
-        except Exception as e:
-            if args.mock_data:
-                log_stage(
-                    f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
-                    f"Error: {e}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Failed to load TFDS training data from {args.data_dir!r}: {e}\n"
-                    "Add the --mock-data flag for testing with random mock batches."
-                ) from e
-
-        # Initialize VAE encode backend
-        log_stage("[VAE-ENCODE] Initializing VAE encoder for online encoding...")
-        vae_encode_fn, vae_encode_params_repl = _build_flax_vae_encode_fn(
-            args.vae_model, num_devices
+    try:
+        dataloader = get_arrayrecord_dataloader(
+            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
         )
-        _vae_encode_cache[0] = (vae_encode_fn, vae_encode_params_repl)
-        log_stage("[VAE-ENCODE] VAE encoder initialized successfully.")
-
-    else:
-        # ── Latent mode: ArrayRecord dataloader (original) ──────────────────
-        try:
-            dataloader = get_arrayrecord_dataloader(
-                data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+        data_iterator = iter(dataloader)
+    except Exception as e:
+        if args.mock_data:
+            log_stage(
+                f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
+                f"This is NOT suitable for real training; metrics will be meaningless. "
+                f"Error: {e}"
             )
-            data_iterator = iter(dataloader)
-        except Exception as e:
-            if args.mock_data:
-                log_stage(
-                    f"WARNING: Real training data unavailable — falling back to RANDOM MOCK BATCHES. "
-                    f"This is NOT suitable for real training; metrics will be meaningless. "
-                    f"Error: {e}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Failed to load training data from {args.data_path!r}: {e}\n"
-                    "If you intentionally want to test with random mock batches (not real training), "
-                    "add the --mock-data flag. Do NOT use mock batches for actual training runs."
-                ) from e
+        else:
+            raise RuntimeError(
+                f"Failed to load training data from {args.data_path!r}: {e}\n"
+                "If you intentionally want to test with random mock batches (not real training), "
+                "add the --mock-data flag. Do NOT use mock batches for actual training runs."
+            ) from e
 
     val_iterator = None
-    if input_mode == "image":
-        # Image mode: TFDS validation
-        try:
-            val_iterator = create_tfds_data_iterator(
-                args.data_dir, 'validation', args.batch_size, shuffle=False
-            )
-        except Exception as e:
-            log_stage(f"Validation disabled (image mode). {e}")
-            val_iterator = None
-    elif args.val_data_path is not None:
+    if args.val_data_path is not None:
         try:
             val_iterator = create_data_iterator(
                 data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False
@@ -1771,6 +1767,106 @@ def main():
 
         threading.Thread(target=_worker, daemon=True).start()
 
+    # ── PCA visualization diagnostic (cadence riêng; async media logging) ────
+    _pca_pmapped = {}  # Cache by (layer, tau)
+
+    def get_pca_pmapped(layer: int, tau_value: float):
+        """Get pmapped function for extracting raw features at a specific layer and timestep."""
+        key = (layer, tau_value)
+        if key not in _pca_pmapped:
+            def _pca_step(ema_params_local, batch_x_local, batch_y_local):
+                local_batch = batch_x_local.shape[0]
+                tau = jnp.ones((local_batch,), dtype=jnp.float32) * tau_value
+                _, feats = state.apply_fn(
+                    {"params": ema_params_local},
+                    batch_x_local,
+                    timesteps=tau,
+                    vector=batch_y_local,
+                    deterministic=True,
+                    return_raw_features=layer,
+                )
+                return feats
+            _pca_pmapped[key] = jax.pmap(_pca_step, axis_name="batch")
+        return _pca_pmapped[key]
+
+    def render_pca_rgb_batch(features_btd, token_hw, resize=256):
+        """Render PCA visualization as RGB images.
+
+        Args:
+            features_btd: (B, T, D) token features
+            token_hw: (H, W) token grid dimensions
+            resize: output image size
+
+        Returns:
+            List of (H, W, 3) uint8 RGB images
+        """
+        B, T, D = features_btd.shape
+        H, W = token_hw
+
+        # Fit PCA on entire batch for consistency
+        all_tokens = features_btd.reshape(-1, D)  # (B*T, D)
+
+        # Center features
+        mean = all_tokens.mean(axis=0, keepdims=True)
+        centered = all_tokens - mean
+
+        # PCA via SVD: top 3 components
+        u, s, vh = np.linalg.svd(centered, full_matrices=False)
+        pca_features = centered @ vh[:3].T  # (B*T, 3)
+
+        # Reshape back to per-sample
+        pca_features = pca_features.reshape(B, T, 3)
+
+        # Render each sample
+        images = []
+        for b in range(B):
+            # Normalize each channel to [0, 1]
+            rgb = pca_features[b]  # (T, 3)
+            for c in range(3):
+                channel = rgb[:, c]
+                min_val = channel.min()
+                max_val = channel.max()
+                rgb[:, c] = (channel - min_val) / (max_val - min_val + 1e-8)
+
+            # Reshape to spatial grid
+            rgb_img = rgb.reshape(H, W, 3)
+
+            # Resize for better visualization
+            if resize > 0 and resize != H:
+                # Use PIL for resizing
+                try:
+                    from PIL import Image
+                    pil_img = Image.fromarray((rgb_img * 255).astype(np.uint8))
+                    pil_img = pil_img.resize((resize, resize), Image.NEAREST)
+                    rgb_img = np.array(pil_img)
+                except ImportError:
+                    # Fallback: just convert to uint8 without resizing
+                    rgb_img = (rgb_img * 255).astype(np.uint8)
+            else:
+                rgb_img = (rgb_img * 255).astype(np.uint8)
+
+            images.append(rgb_img)
+
+        return images
+
+    def log_pca_async(images_by_layer, step, tau_value):
+        """Log PCA visualizations to WandB asynchronously."""
+        def _worker():
+            if getattr(wandb, "run", None) is None:
+                return
+
+            payload = {"train/step": step}
+            for layer, imgs in images_by_layer.items():
+                wandb_images = [
+                    wandb.Image(img, caption=f"step={step}, tau={tau_value:.1f}, layer={layer}, sample={i}")
+                    for i, img in enumerate(imgs)
+                ]
+                payload[f"diag/pca_layer_{layer}"] = wandb_images
+
+            safe_wandb_log(payload, step=step)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def run_preflight_linear_probe(batch_x_patchified, batch_y):
         probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
         W_repl, b_repl = get_probe_weights()
@@ -1823,7 +1919,9 @@ def main():
             f"[FID probe] decoding one real validation batch of {args.batch_size} latents "
             f"with VAE micro-batch {args.vae_decode_batch_size}..."
         )
-        probe_val_batch, val_data_iter = _get_next_val_batch(val_data_iter)
+        probe_val_batch, val_data_iter = next_validation_batch(
+            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+        )
         real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
         real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
         extract_inception_features_host_images(
@@ -1861,29 +1959,6 @@ def main():
         return val_data_iter, cached_train_batch
 
     _eval_real_cache = [None]  # dict with pooled/spatial stats and metadata
-
-    def _get_next_val_batch(val_data_iter):
-        """Get next validation batch as (patchified_latents, labels) regardless of input mode.
-
-        Image mode: loads images → encode → patchify
-        Latent mode: loads pre-computed patchified latents (original behavior)
-        Returns (batch, updated_val_iter) where batch = (patchified_latents, labels).
-        """
-        if input_mode == "image":
-            raw_batch, val_data_iter = next_tfds_validation_batch(
-                val_data_iter, data_dir=args.data_dir, batch_size=args.batch_size,
-            )
-            v_images = np.asarray(raw_batch[0], dtype=np.float32)
-            v_labels = np.asarray(raw_batch[1], dtype=np.int32)
-            enc_fn, enc_params = _vae_encode_cache[0]
-            v_tokens, v_labels, _ = preprocess_batch_for_dit(
-                v_images, v_labels, enc_fn, enc_params, num_devices
-            )
-            return (v_tokens, v_labels), val_data_iter
-        else:
-            return next_validation_batch(
-                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size,
-            )
 
     def compute_eval_metrics(step, val_data_iter):
         """Hot-path eval for FID-bundled metrics (streaming, sharded, static shapes).
@@ -1925,7 +2000,9 @@ def main():
             pr_real_sampler = ReservoirSampler(pr_eval_samples, seed=0) if pr_enabled else None
             seen = 0
             while seen < need and current_val_iter is not None:
-                vbatch, current_val_iter = _get_next_val_batch(current_val_iter)
+                vbatch, current_val_iter = next_validation_batch(
+                    current_val_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                )
                 latents_all = unpatchify_patchified_latents(vbatch[0])  # (B,4,32,32) numpy
                 # Stream through this batch in fixed global_b chunks
                 for start in range(0, latents_all.shape[0], global_b):
@@ -2071,7 +2148,9 @@ def main():
             for i in range(int(args.probe_eval_batches)):
                 if probe_iter is None:
                     break
-                vbatch, probe_iter = _get_next_val_batch(probe_iter)
+                vbatch, probe_iter = next_validation_batch(
+                    probe_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                )
                 bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
                 by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
                 corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
@@ -2104,7 +2183,9 @@ def main():
         bc_fn = get_blockcorr_pmapped()
         block_batches = []
         for i in range(int(args.block_corr_batches)):
-            vbatch, val_data_iter = _get_next_val_batch(val_data_iter)
+            vbatch, val_data_iter = next_validation_batch(
+                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            )
             bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
             by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
             summaries = bc_fn(ema_params, bx, by)
@@ -2122,29 +2203,82 @@ def main():
         log_blockcorr_async(corr.astype(np.float32), step=step)
         return val_data_iter
 
+    def compute_pca_panels(step, val_data_iter):
+        """PCA feature visualization diagnostic."""
+        if args.pca_freq <= 0:
+            return val_data_iter
+        if val_data_iter is None:
+            raise RuntimeError("PCA visualization requires --val-data-path")
+
+        # Parse layers to visualize
+        try:
+            pca_layers = [int(x.strip()) for x in args.pca_layers.split(",")]
+        except ValueError as e:
+            log_stage(f"[PCA] Invalid --pca-layers format: {e}")
+            return val_data_iter
+
+        # Get one fixed batch for visualization
+        vbatch, val_data_iter = next_validation_batch(
+            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+        )
+        bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+
+        # Token grid dimensions for reshaping
+        token_grid_size = int(n_patches ** 0.5)
+        token_hw = (token_grid_size, token_grid_size)
+
+        images_by_layer = {}
+        params_to_use = ema_params if args.pca_use_ema else state.params
+
+        for layer in pca_layers:
+            if layer < 1 or layer > depth:
+                log_stage(f"[PCA] Skipping invalid layer {layer} (depth={depth})")
+                continue
+
+            try:
+                # Extract raw features at this layer
+                pca_fn = get_pca_pmapped(layer, args.pca_tau)
+                feats = pca_fn(params_to_use, bx, by)  # (devices, local_batch, T, D)
+
+                # Transfer to host and reshape
+                feats_h = np.asarray(jax.device_get(feats), dtype=np.float32)
+                feats_h = feats_h.reshape(-1, feats_h.shape[2], feats_h.shape[3])  # (global_batch, T, D)
+
+                # Take first N samples
+                num_samples = min(args.pca_num_samples, feats_h.shape[0])
+                feats_h = feats_h[:num_samples]
+
+                # Render PCA RGB images
+                images = render_pca_rgb_batch(feats_h, token_hw, resize=args.pca_resize)
+                images_by_layer[layer] = images
+
+                log_stage(
+                    f"[PCA] step {step}, layer {layer}: rendered {len(images)} PCA visualizations at tau={args.pca_tau}"
+                )
+            except Exception as e:
+                log_stage(f"[PCA] Error rendering layer {layer}: {e}")
+                continue
+
+        # Log to WandB asynchronously
+        if images_by_layer:
+            log_pca_async(images_by_layer, step=step, tau_value=args.pca_tau)
+
+        return val_data_iter
+
     # ── Preflight checks ──────────────────────────────────────────────────────
     prefetched_train_batch = None
     if args.preflight_checks:
         inception_fn_for_preflight = get_inception("pooled+spatial") if args.preflight_fid_samples > 0 else None
         preflight_real_batch = None
         if val_iterator is not None:
-            preflight_batch, val_iterator = _get_next_val_batch(val_iterator)
+            preflight_batch, val_iterator = next_validation_batch(
+                val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+            )
             preflight_real_batch = preflight_batch
         elif data_iterator is not None:
-            raw_train_batch = next(data_iterator)
-            if input_mode == "image":
-                # Convert to patchified format for preflight
-                t_images = np.asarray(raw_train_batch[0], dtype=np.float32)
-                t_labels = np.asarray(raw_train_batch[1], dtype=np.int32)
-                enc_fn, enc_params = _vae_encode_cache[0]
-                t_tokens, t_labels, _ = preprocess_batch_for_dit(
-                    t_images, t_labels, enc_fn, enc_params, num_devices
-                )
-                preflight_real_batch = (t_tokens, t_labels)
-                # Don't set prefetched_train_batch since we already consumed it
-            else:
-                prefetched_train_batch = raw_train_batch
-                preflight_real_batch = prefetched_train_batch
+            prefetched_train_batch = next(data_iterator)
+            preflight_real_batch = prefetched_train_batch
 
         rng = run_preflight_checks(
             state=state,
@@ -2188,29 +2322,36 @@ def main():
                     prefetched_train_batch = None
                 else:
                     batch = next(data_iterator)
-
-                if input_mode == "image":
-                    # Online VAE encode: images -> latents -> patchify
-                    images_nchw = np.asarray(batch[0], dtype=np.float32)
-                    labels = np.asarray(batch[1], dtype=np.int32)
-                    enc_fn, enc_params = _vae_encode_cache[0]
-                    tokens, labels, _ = preprocess_batch_for_dit(
-                        images_nchw, labels, enc_fn, enc_params, num_devices
-                    )
-                    batch_x = jnp.array(tokens)
-                    batch_y = jnp.array(labels)
-                else:
-                    # Latent mode: batch already contains patchified latents
-                    batch_x = jnp.array(batch[0])
-                    batch_y = jnp.array(batch[1])
+                batch_x = jnp.array(batch[0])
+                batch_y = jnp.array(batch[1])
             else:
                 # Mock fallback: only reaches here if --mock-data was explicitly set
                 rng_mock, = jax.random.split(rng[0], 1)
-                batch_x = jax.random.normal(rng_mock, (args.batch_size, n_patches, patch_dim))
+                if args.stage in ["stage1", "stage2"]:
+                    # Mock moments data
+                    batch_x = jax.random.normal(rng_mock, (args.batch_size, 8, 32, 32))
+                else:
+                    # Mock latent data
+                    batch_x = jax.random.normal(rng_mock, (args.batch_size, 4, 32, 32))
                 batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
 
-            # Reshape for SPMD: (Global, ...) -> (Devices, Local, ...)
-            batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+            # Process batch based on stage
+            if args.stage in ["stage1", "stage2"]:
+                # For Self-Transcendence stages: batch_x is moments (B, 8, H, W)
+                # Will be sampled and patchified in train step
+                batch_x = batch_x.reshape(num_devices, local_batch_size, 8, 32, 32)
+            else:
+                # For vanilla: batch_x is latents (B, 4, H, W), need to patchify
+                # Patchify: (B, 4, 32, 32) -> (B, 256, 16)
+                batch_x_np = np.array(batch_x)  # (B, 4, 32, 32)
+                b, c, h, w = batch_x_np.shape
+                p = 2
+                batch_x_np = np.reshape(batch_x_np, (b, c, h // p, p, w // p, p))
+                batch_x_np = np.transpose(batch_x_np, (0, 2, 4, 3, 5, 1))  # (B, H//p, W//p, p, p, C)
+                batch_x_np = np.reshape(batch_x_np, (b, (h // p) * (w // p), p * p * c))
+                batch_x = jnp.array(batch_x_np)
+                batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
@@ -2236,25 +2377,38 @@ def main():
                 print(f"Step {global_step}: Evaluating validation loss over {args.eval_batches} batch(es)...")
                 metric_sums = {}
                 for _ in range(args.eval_batches):
-                    if input_mode == "image":
-                        val_batch, val_iterator = next_tfds_validation_batch(
-                            val_iterator, data_dir=args.data_dir, batch_size=args.batch_size,
-                        )
-                        # Encode + patchify for consistent format
-                        v_images = np.asarray(val_batch[0], dtype=np.float32)
-                        v_labels = np.asarray(val_batch[1], dtype=np.int32)
-                        enc_fn, enc_params = _vae_encode_cache[0]
-                        v_tokens, v_labels, _ = preprocess_batch_for_dit(
-                            v_images, v_labels, enc_fn, enc_params, num_devices
-                        )
-                        val_x = jnp.array(v_tokens).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                        val_y = jnp.array(v_labels).reshape(num_devices, local_batch_size)
+                    val_batch, val_iterator = next_validation_batch(
+                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                    )
+                    val_x = jnp.array(val_batch[0])
+                    val_y = jnp.array(val_batch[1])
+
+                    # Process validation batch (eval_step expects patchified tokens)
+                    if args.stage in ["stage1", "stage2"]:
+                        # Val data is moments, need to sample and patchify
+                        # For simplicity, use mean instead of sampling for validation
+                        val_x_moments = val_x
+                        val_x_latent = val_x_moments[:, :4, :, :]  # Use mean only
+                        # Patchify
+                        b, c, h, w = val_x_latent.shape
+                        p = 2
+                        val_x_np = np.array(val_x_latent)
+                        val_x_np = np.reshape(val_x_np, (b, c, h // p, p, w // p, p))
+                        val_x_np = np.transpose(val_x_np, (0, 2, 4, 3, 5, 1))
+                        val_x_np = np.reshape(val_x_np, (b, (h // p) * (w // p), p * p * c))
+                        val_x = jnp.array(val_x_np)
                     else:
-                        val_batch, val_iterator = next_validation_batch(
-                            val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
-                        )
-                        val_x = jnp.array(val_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                        val_y = jnp.array(val_batch[1]).reshape(num_devices, local_batch_size)
+                        # Val data is latents, need to patchify
+                        b, c, h, w = val_x.shape
+                        p = 2
+                        val_x_np = np.array(val_x)
+                        val_x_np = np.reshape(val_x_np, (b, c, h // p, p, w // p, p))
+                        val_x_np = np.transpose(val_x_np, (0, 2, 4, 3, 5, 1))
+                        val_x_np = np.reshape(val_x_np, (b, (h // p) * (w // p), p * p * c))
+                        val_x = jnp.array(val_x_np)
+
+                    val_x = val_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                    val_y = val_y.reshape(num_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
@@ -2276,6 +2430,12 @@ def main():
                     val_iterator = compute_block_corr(global_step, val_iterator)
                 except Exception as exc:
                     log_stage(f"BLOCKCORR skipped: {exc}")
+
+            if args.pca_freq > 0 and global_step % args.pca_freq == 0:
+                try:
+                    val_iterator = compute_pca_panels(global_step, val_iterator)
+                except Exception as exc:
+                    log_stage(f"PCA skipped: {exc}")
 
             # Sample preview: uses EMA params and configurable num_steps
             if args.sample_freq > 0 and global_step % args.sample_freq == 0:
@@ -2302,20 +2462,26 @@ def main():
                                  args=(latents_dev, sample_classes, global_step),
                                  daemon=True).start()
 
-    # ── Checkpoint save (online params + EMA params) ──────────────────────────
-    os.makedirs(args.ckpt_dir, exist_ok=True)
-    unreplicated_params = jax_utils.unreplicate(state.params)
-    unreplicated_ema    = jax_utils.unreplicate(ema_params)
-    checkpoints.save_checkpoint(
-        ckpt_dir=args.ckpt_dir,
-        target=unreplicated_params,
-        step=global_step,
-    )
-    checkpoints.save_checkpoint(
-        ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
-        target=unreplicated_ema,
-        step=global_step,
-    )
+    # ── Checkpoint save (only coordinator saves to avoid conflicts) ────────────
+    if is_coordinator:
+        log_stage(f"Saving final checkpoint at step {global_step}...")
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        unreplicated_params = jax_utils.unreplicate(state.params)
+        unreplicated_ema    = jax_utils.unreplicate(ema_params)
+        checkpoints.save_checkpoint(
+            ckpt_dir=args.ckpt_dir,
+            target=unreplicated_params,
+            step=global_step,
+        )
+        checkpoints.save_checkpoint(
+            ckpt_dir=os.path.join(args.ckpt_dir, "ema"),
+            target=unreplicated_ema,
+            step=global_step,
+        )
+        log_stage("Checkpoints saved successfully.")
+    else:
+        # Non-coordinator workers just wait for coordinator to finish
+        log_stage(f"Worker {process_index}: Checkpoint saving delegated to coordinator.")
     if _flax_decode_cache[0] is not None and isinstance(_flax_decode_cache[0], VAEDecodeSubprocess):
         _flax_decode_cache[0].shutdown()
     if _is_worker[0] is not None:

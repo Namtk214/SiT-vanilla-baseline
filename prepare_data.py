@@ -156,22 +156,27 @@ def main():
         # Move images to GPU and FP16 to match VAE
         images = images.to(device, dtype=torch.float16)
         
-        # Encode with VAE
-        # using sample() gives the latents, applying scale right now.
+        # Encode with VAE to get moments (mean and logvar)
+        # Save moments instead of sampled latents for Self-Transcendence training
         latent_dist = vae.encode(images).latent_dist
-        latents = latent_dist.sample() * SCALE_FACTOR
-        
-        # Move latents back to CPU as Float32 numpy arrays for serialization
-        latents_np = latents.cpu().to(torch.float32).numpy()
+        mean = latent_dist.mean * SCALE_FACTOR
+        logvar = latent_dist.logvar  # Don't scale logvar
+
+        # Concatenate mean and logvar along channel dimension
+        # moments shape: (B, 8, 32, 32) where first 4 channels are mean, last 4 are logvar
+        moments = torch.cat([mean, logvar], dim=1)
+
+        # Move moments back to CPU as Float32 numpy arrays for serialization
+        moments_np = moments.cpu().to(torch.float32).numpy()
         labels_np = labels.cpu().numpy()
-        
+
         # Iterate over batch and write each single record iteratively
-        for latent, label in zip(latents_np, labels_np):
-            
-            # Serialize payload natively (Pickle is simple and fast for Grain reading later)
+        for moment, label in zip(moments_np, labels_np):
+
+            # Serialize payload with moments instead of latent
             payload = {
-                "latent": latent, # Shape (4, 32, 32)
-                "label": label    # Int
+                "moments": moment, # Shape (8, 32, 32) - concatenated mean and logvar
+                "label": label     # Int
             }
             serialized = pickle.dumps(payload)
             writer.write(serialized)

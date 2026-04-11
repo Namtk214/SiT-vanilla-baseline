@@ -244,15 +244,30 @@ class SelfFlowDiT(nn.Module):
     per_token: bool = False
     use_remat: bool = True
     use_scan: bool = True
+    encoder_depth: int = -1  # Depth to extract auxiliary features for Stage 1 (-1 = disabled)
+    projector_dim: int = 1152  # Dimension for feature projector
+    dropout_prob: float = 0.0  # Classifier-free guidance dropout probability
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+
+        # Auxiliary head for Stage 1 VAE structure guidance
+        # Projects shallow features to token-space predictions
+        if self.encoder_depth > 0:
+            self.aux_projector = SimpleHead(in_dim=self.hidden_size, out_dim=self.projector_dim)
+            # Final projection to output space (same as main output)
+            patch_dim = self.patch_size * self.patch_size * self.in_channels
+            self.aux_head = nn.Dense(patch_dim)
+
+        # Feature projector for Stage 2 self-guided representation
+        # Note: This is separate from aux_projector (Stage 1)
+        self.stage2_projector = SimpleHead(in_dim=self.hidden_size, out_dim=self.projector_dim)
 
     @nn.compact
     def __call__(
@@ -284,7 +299,11 @@ class SelfFlowDiT(nn.Module):
         x = x + self.pos_embed_val
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
+        y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=self.dropout_prob
+        )
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
@@ -316,6 +335,7 @@ class SelfFlowDiT(nn.Module):
             BlockCls = DiTBlock
 
         zs = None
+        aux_pred = None  # Auxiliary prediction for Stage 1
         block_summaries = [] if return_block_summaries else None
 
         # use_scan compiles a single block and loops over it, dramatically
@@ -326,6 +346,7 @@ class SelfFlowDiT(nn.Module):
             and not return_block_summaries
             and not return_features
             and not return_raw_features
+            and self.encoder_depth <= 0  # Can't use scan if we need auxiliary features
         )
 
         if use_scan_now:
@@ -346,9 +367,7 @@ class SelfFlowDiT(nn.Module):
                         mlp_ratio=self.mlp_ratio,
                         per_token=self.per_token,
                     )(x, c_step)
-                    # Return per-block activation magnitude for monitoring
-                    act_mag = jnp.mean(jnp.abs(x))
-                    return x, act_mag
+                    return x, None
 
             ScannedBlock = nn.scan(
                 _ScanWrapper,
@@ -362,17 +381,14 @@ class SelfFlowDiT(nn.Module):
                 jnp.expand_dims(c, 0),
                 (self.depth,) + c.shape,
             )
-            x, block_act_mags = ScannedBlock(
+            x, _ = ScannedBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token,
             )(x, c_tiled)
-            # block_act_mags: (depth,) — mean |activation| per block
-            self.sow('intermediates', 'block_act_magnitudes', block_act_mags)
         else:
             # Unrolled loop (needed for block summaries / feature extraction).
-            _unrolled_act_mags = []
             for i in range(self.depth):
                 x = BlockCls(
                     hidden_size=self.hidden_size,
@@ -381,18 +397,22 @@ class SelfFlowDiT(nn.Module):
                     per_token=self.per_token,
                 )(x, c)
 
-                _unrolled_act_mags.append(jnp.mean(jnp.abs(x)))
-
                 if return_block_summaries:
                     block_summaries.append(jnp.mean(x, axis=1))
 
+                # Extract features for self-distillation (Stage 2)
                 if (i + 1) == return_features:
-                    zs = self.feature_head(x)
+                    # For Stage 2 student: project features for distillation loss
+                    zs = self.stage2_projector(x)
                 elif (i + 1) == return_raw_features:
+                    # For Stage 2 teacher: return raw features (will be projected in train step)
                     zs = x
 
-            self.sow('intermediates', 'block_act_magnitudes',
-                     jnp.stack(_unrolled_act_mags))
+                # Extract auxiliary prediction for Stage 1
+                if self.encoder_depth > 0 and (i + 1) == self.encoder_depth:
+                    # Shallow features -> projector -> token prediction
+                    aux_feat = self.aux_projector(x)
+                    aux_pred = self.aux_head(aux_feat)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
@@ -402,12 +422,22 @@ class SelfFlowDiT(nn.Module):
         )(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
+        # Handle auxiliary prediction shufflechannel (same as main)
+        if aux_pred is not None:
+            aux_pred = -aux_pred  # Same negation as main output
+
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        # Return auxiliary prediction if Stage 1 is enabled
+        if aux_pred is not None:
+            if return_block_summaries:
+                return x, aux_pred, block_summaries
+            return x, aux_pred
 
         if return_features or return_raw_features:
             if return_block_summaries:

@@ -48,9 +48,10 @@ def _model_config_for_size(model_size):
         depth=variant["depth"],
         num_heads=variant["num_heads"],
         mlp_ratio=4.0,
-        num_classes=1001,
-        learn_sigma=True,
-        compatibility_mode=True,
+        num_classes=1000,
+        learn_sigma=False,
+        compatibility_mode=False,
+        dropout_prob=0.1,
     )
 
 
@@ -150,7 +151,7 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
         use_cfg = cfg_scale > 1.0
         if use_cfg:
             x = jnp.concatenate([x, x], axis=0)
-            null_labels = jnp.full_like(class_labels, 1000)
+            null_labels = jnp.full_like(class_labels, model.num_classes)
             class_labels = jnp.concatenate([null_labels, class_labels], axis=0)
             
         def model_fn(z_x, t):
