@@ -2,14 +2,15 @@
 Self-Flow Modules.
 """
 
-from .model import SelfFlowPerTokenDiT
+from .model import SelfFlowDiT
 from .sampling import denoise_loop
-from .utils import batched_prc_img, scatter_ids, scattercat
+
+# Backward compatibility alias
+SelfFlowPerTokenDiT = SelfFlowDiT
 
 __all__ = [
+    "SelfFlowDiT",
     "SelfFlowPerTokenDiT",
     "denoise_loop",
-    "batched_prc_img",
-    "scatter_ids",
-    "scattercat",
 ]
+

@@ -155,14 +155,15 @@ def build_sample_step(model, vae, scale_factor, shift_factor):
             class_labels = jnp.concatenate([null_labels, class_labels], axis=0)
             
         def model_fn(z_x, t):
-            # z_x has dynamic shape inside compilation, but tracing fixes it
-            return model.apply(
+            out = model.apply(
                 {"params": params},
                 z_x,
                 timesteps=t,
                 vector=class_labels,
-                deterministic=True
+                deterministic=True,
             )
+            # stage1/stage2: (velocity, aux) tuple → extract velocity
+            return out[0] if isinstance(out, (tuple, list)) else out
             
         rng, denoise_rng = jax.random.split(rng)
         samples = denoise_loop(

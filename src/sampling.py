@@ -342,7 +342,9 @@ def denoise_loop(
         d_cur = model_fn(x_cur.astype(jnp.float32), t_batch)
 
         if cfg_scale is not None and cfg_scale > 1.0:
-            d_cond, d_uncond = jnp.split(d_cur, 2, axis=0)
+            # Model input was concatenated as [null_labels, real_labels] in train.py
+            # So first half = uncond predictions, second half = cond predictions
+            d_uncond, d_cond = jnp.split(d_cur, 2, axis=0)
             # Apply guidance within the specified range
             # In our convention: tau_cur corresponds to original t = 1 - tau_cur
             # guidance_low/high are in original t convention
