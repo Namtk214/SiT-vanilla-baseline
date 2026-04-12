@@ -1,8 +1,12 @@
 """
 Self-Flow Model (Flax version).
 
-This module contains the SelfFlowPerTokenDiT model, a Diffusion Transformer
-with per-token timestep conditioning for Self-Flow training, implemented in Flax.
+Faithfully mirrors Self-Transcendence PyTorch implementation:
+- xavier_uniform init for all Dense layers
+- normal(stddev=0.02) for timestep/label embeddings
+- QK Norm in attention (matching timm Attention(qk_norm=True))
+- Correct Stage 1 auxiliary branch: build_mlp → FinalLayer_2 → unpatchify
+- Zero-init for adaLN modulation and final layer output
 """
 
 import math
@@ -14,6 +18,13 @@ import flax.linen as nn
 from einops import rearrange
 
 
+# ─── Initialization helpers ───────────────────────────────────────────────────
+_xavier = nn.initializers.xavier_uniform()
+_normal_002 = nn.initializers.normal(stddev=0.02)
+_zero = nn.initializers.zeros
+
+
+# ─── Position embeddings ──────────────────────────────────────────────────────
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
     omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
@@ -45,8 +56,9 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size):
     return pos_embed
 
 
+# ─── Patch Embedding ──────────────────────────────────────────────────────────
 class PatchedPatchEmbed(nn.Module):
-    """Simplified Sequence to Patch Embedding using Linear layer."""
+    """Patch Embedding using Dense (matching PyTorch PatchEmbed xavier_uniform init)."""
     img_size: int = 224
     patch_size: int = 16
     in_channels: int = 3
@@ -55,9 +67,14 @@ class PatchedPatchEmbed(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return nn.Dense(self.embed_dim, use_bias=self.bias, name="proj")(x)
+        return nn.Dense(
+            self.embed_dim, use_bias=self.bias,
+            kernel_init=_xavier,
+            name="proj",
+        )(x)
 
 
+# ─── Modulation helpers ──────────────────────────────────────────────────────
 def modulate(x, shift, scale):
     """Standard modulation with unsqueeze for (N, D) conditioning."""
     return x * (1 + scale[:, None, :]) + shift[:, None, :]
@@ -68,8 +85,12 @@ def modulate_per_token(x, shift, scale):
     return x * (1 + scale) + shift
 
 
+# ─── Timestep Embedder ────────────────────────────────────────────────────────
 class TimestepEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
+    """Embeds scalar timesteps into vector representations.
+    
+    Init: normal(stddev=0.02) for MLP weights, matching PyTorch.
+    """
     hidden_size: int
     frequency_embedding_size: int = 256
 
@@ -86,14 +107,18 @@ class TimestepEmbedder(nn.Module):
     @nn.compact
     def __call__(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        x = nn.Dense(self.hidden_size)(t_freq)
+        x = nn.Dense(self.hidden_size, kernel_init=_normal_002)(t_freq)
         x = nn.swish(x)
-        x = nn.Dense(self.hidden_size)(x)
+        x = nn.Dense(self.hidden_size, kernel_init=_normal_002)(x)
         return x
 
 
+# ─── Label Embedder ───────────────────────────────────────────────────────────
 class LabelEmbedder(nn.Module):
-    """Embeds class labels into vector representations."""
+    """Embeds class labels into vector representations.
+    
+    Init: normal(stddev=0.02) for embedding table, matching PyTorch.
+    """
     num_classes: int
     hidden_size: int
     dropout_prob: float
@@ -102,8 +127,9 @@ class LabelEmbedder(nn.Module):
     def __call__(self, labels, deterministic: bool = True, force_drop_ids=None):
         use_cfg_embedding = self.dropout_prob > 0
         embedding_table = nn.Embed(
-            num_embeddings=self.num_classes + use_cfg_embedding, 
-            features=self.hidden_size
+            num_embeddings=self.num_classes + use_cfg_embedding,
+            features=self.hidden_size,
+            embedding_init=_normal_002,
         )
 
         use_dropout = self.dropout_prob > 0
@@ -118,8 +144,65 @@ class LabelEmbedder(nn.Module):
         return embedding_table(labels)
 
 
+# ─── Attention with QK Norm ──────────────────────────────────────────────────
+class AttentionQKNorm(nn.Module):
+    """Multi-head self-attention with QK Norm.
+
+    Matches timm Attention(qkv_bias=True, qk_norm=True):
+    - Projects input to Q, K, V via a single Dense
+    - Applies per-head LayerNorm to Q and K
+    - Computes scaled dot-product attention
+    - Projects output
+    
+    All Dense layers use xavier_uniform init.
+    """
+    hidden_size: int
+    num_heads: int
+
+    @nn.compact
+    def __call__(self, x):
+        B, N, C = x.shape
+        head_dim = self.hidden_size // self.num_heads
+
+        # QKV projection (single Dense, like timm)
+        qkv = nn.Dense(
+            3 * self.hidden_size, use_bias=True,
+            kernel_init=_xavier, name="qkv",
+        )(x)
+        qkv = qkv.reshape(B, N, 3, self.num_heads, head_dim)
+        qkv = jnp.transpose(qkv, (2, 0, 3, 1, 4))  # (3, B, heads, N, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # QK Norm: per-head LayerNorm (matching timm qk_norm=True)
+        q = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=True, name="q_norm")(q)
+        k = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=True, name="k_norm")(k)
+
+        # Scaled dot-product attention
+        scale = head_dim ** -0.5
+        attn_weights = jnp.einsum("bhqd,bhkd->bhqk", q, k) * scale
+        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
+
+        # Attend to values
+        attn_output = jnp.einsum("bhqk,bhkd->bhqd", attn_weights, v)
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, N, self.hidden_size)
+
+        # Output projection
+        out = nn.Dense(
+            self.hidden_size, use_bias=True,
+            kernel_init=_xavier, name="proj",
+        )(attn_output)
+        return out
+
+
+# ─── DiT Block ────────────────────────────────────────────────────────────────
 class DiTBlock(nn.Module):
-    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
+    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    adaLN modulation Dense is zero-initialized so that gates start at 0,
+    making each block an identity function at initialization (DiT convention).
+    All other Dense layers use xavier_uniform init.
+    Attention uses QK Norm matching timm Attention(qk_norm=True).
+    """
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
@@ -130,57 +213,58 @@ class DiTBlock(nn.Module):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
-        
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c_flat)
+            c_act = nn.swish(c_flat)
+            modulation_flat = nn.Dense(
+                6 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
-            
+
             x_norm = modulate_per_token(norm1(x), shift_msa, scale_msa)
-            # Self Attention
-            attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
-            )(x_norm, x_norm)
+            attn = AttentionQKNorm(hidden_size=self.hidden_size, num_heads=self.num_heads)(x_norm)
             x = x + gate_msa * attn
-            
+
             x_norm2 = modulate_per_token(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
+                nn.Dense(mlp_hidden_dim, kernel_init=_xavier),
                 lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
+                nn.Dense(self.hidden_size, kernel_init=_xavier),
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c)
+            c_act = nn.swish(c)
+            modulation = nn.Dense(
+                6 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
-            
+
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
-            attn = nn.MultiHeadDotProductAttention(
-                num_heads=self.num_heads, qkv_features=self.hidden_size, out_features=self.hidden_size
-            )(x_norm, x_norm)
+            attn = AttentionQKNorm(hidden_size=self.hidden_size, num_heads=self.num_heads)(x_norm)
             x = x + gate_msa[:, None, :] * attn
-            
+
             x_norm2 = modulate(norm2(x), shift_mlp, scale_mlp)
             mlp_fn = nn.Sequential([
-                nn.Dense(mlp_hidden_dim),
+                nn.Dense(mlp_hidden_dim, kernel_init=_xavier),
                 lambda z: nn.gelu(z, approximate=True),
-                nn.Dense(self.hidden_size)
+                nn.Dense(self.hidden_size, kernel_init=_xavier),
             ])
             x = x + gate_mlp[:, None, :] * mlp_fn(x_norm2)
-            
+
         return x
 
 
+# ─── Final Layers ─────────────────────────────────────────────────────────────
 class FinalLayer(nn.Module):
-    """The final layer of DiT."""
+    """The final layer of DiT (with adaLN modulation).
+
+    adaLN and linear are zero-initialized so initial model prediction is zero.
+    """
     hidden_size: int
     patch_size: int
     out_channels: int
@@ -189,48 +273,106 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
-        
+        linear = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=_zero, bias_init=_zero,
+            name="linear",
+        )
+
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c_flat)
+            c_act = nn.swish(c_flat)
+            modulation_flat = nn.Dense(
+                2 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
-            
+
             x = modulate_per_token(norm_final(x), shift, scale)
             x = linear(x)
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c)
+            c_act = nn.swish(c)
+            modulation = nn.Dense(
+                2 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             shift, scale = jnp.split(modulation, 2, axis=1)
-            
+
             x = modulate(norm_final(x), shift, scale)
             x = linear(x)
-            
+
         return x
 
 
+class FinalLayer2(nn.Module):
+    """Auxiliary final layer (NO adaLN, just LayerNorm + Linear).
+    
+    Matches PyTorch FinalLayer_2: 
+        self.norm_final = LayerNorm(hidden_size, elementwise_affine=False)
+        self.linear = Linear(hidden_size, patch_size**2 * out_channels)
+    
+    Uses xavier_uniform init for linear (will be overridden by _basic_init in PyTorch).
+    """
+    hidden_size: int
+    patch_size: int
+    out_channels: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)(x)
+        x = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=_xavier,
+            name="linear",
+        )(x)
+        return x
+
+
+# ─── Feature Projectors ──────────────────────────────────────────────────────
 class SimpleHead(nn.Module):
-    """Simple projection head for self-distillation."""
+    """Simple projection head for self-distillation (Stage 2)."""
     in_dim: int
     out_dim: int
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.in_dim + self.out_dim)(x)
+        x = nn.Dense(self.in_dim + self.out_dim, kernel_init=_xavier)(x)
         x = nn.swish(x)
-        x = nn.Dense(self.out_dim)(x)
+        x = nn.Dense(self.out_dim, kernel_init=_xavier)(x)
         return x
 
 
+class BuildMLP(nn.Module):
+    """3-layer MLP projector matching PyTorch build_mlp(hidden_size, projector_dim, z_dim).
+    
+    Structure: Linear(hidden→proj) → SiLU → Linear(proj→proj) → SiLU → Linear(proj→z)
+    Uses xavier_uniform for all layers.
+    """
+    hidden_size: int
+    projector_dim: int
+    z_dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.projector_dim, kernel_init=_xavier)(x)
+        x = nn.swish(x)
+        x = nn.Dense(self.projector_dim, kernel_init=_xavier)(x)
+        x = nn.swish(x)
+        x = nn.Dense(self.z_dim, kernel_init=_xavier)(x)
+        return x
+
+
+# ─── Main Model ──────────────────────────────────────────────────────────────
 class SelfFlowDiT(nn.Module):
-    """Base Self-Flow DiT model."""
+    """Base Self-Flow DiT model.
+    
+    Faithfully mirrors Self-Transcendence PyTorch SiT architecture:
+    - Weight init: xavier_uniform for Dense, normal(0.02) for embeddings, zero for adaLN/final
+    - QK Norm in attention
+    - Stage 1 aux branch: build_mlp(hidden, 2048, hidden) → FinalLayer_2 → output
+    """
     input_size: int = 32
     patch_size: int = 2
     in_channels: int = 4
@@ -244,15 +386,36 @@ class SelfFlowDiT(nn.Module):
     per_token: bool = False
     use_remat: bool = True
     use_scan: bool = True
+    encoder_depth: int = -1  # Depth to extract auxiliary features for Stage 1 (-1 = disabled)
+    projector_dim: int = 2048  # PyTorch default: 2048
+    dropout_prob: float = 0.0
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
         self.grid_size = self.input_size // self.patch_size
         self.num_patches = self.grid_size * self.grid_size
-        
+
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
-        self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
+        self.pos_embed_val = pos_embed[None, ...]  # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+
+        # Stage 1: auxiliary branch (projectors + FinalLayer_2)
+        if self.encoder_depth > 0:
+            # 3-layer MLP: hidden_size → projector_dim → projector_dim → hidden_size
+            self.aux_projectors = BuildMLP(
+                hidden_size=self.hidden_size,
+                projector_dim=self.projector_dim,
+                z_dim=self.hidden_size,
+            )
+            # FinalLayer_2: LayerNorm + Linear (NO adaLN)
+            self.aux_final = FinalLayer2(
+                hidden_size=self.hidden_size,
+                patch_size=self.patch_size,
+                out_channels=self.out_channels_val,
+            )
+
+        # Stage 2: self-guided representation projector
+        self.stage2_projector = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
 
     @nn.compact
     def __call__(
@@ -266,25 +429,27 @@ class SelfFlowDiT(nn.Module):
         return_block_summaries: bool = False,
         deterministic: bool = True,
     ):
-        """Forward pass with compatibility mode handling."""
+        """Forward pass."""
         assert not (return_raw_features and return_features)
-        # return_block_summaries can be combined with either mode; callers must
-        # handle the expanded return tuple shape.
 
         # PyTorch implementation explicitly negates timesteps
         timesteps = 1.0 - timesteps
 
         # Patch Embedding
         x = PatchedPatchEmbed(
-            img_size=self.input_size, 
-            patch_size=self.patch_size, 
-            in_channels=self.in_channels, 
-            embed_dim=self.hidden_size
+            img_size=self.input_size,
+            patch_size=self.patch_size,
+            in_channels=self.in_channels,
+            embed_dim=self.hidden_size,
         )(x)
         x = x + self.pos_embed_val
 
         t_embedder = TimestepEmbedder(hidden_size=self.hidden_size)
-        y_embedder = LabelEmbedder(num_classes=self.num_classes, hidden_size=self.hidden_size, dropout_prob=0.0)
+        y_embedder = LabelEmbedder(
+            num_classes=self.num_classes,
+            hidden_size=self.hidden_size,
+            dropout_prob=self.dropout_prob,
+        )
 
         if self.per_token:
             batch_size, seq_len, _ = x.shape
@@ -297,7 +462,7 @@ class SelfFlowDiT(nn.Module):
                 t_emb = t_emb_flat.reshape(batch_size, seq_len, -1)
             else:
                 raise ValueError(f"Unsupported per-token timestep rank: {timesteps.ndim}")
-            
+
             y_emb = y_embedder(vector, deterministic=deterministic)
             y_emb = jnp.tile(y_emb[:, None, :], (1, seq_len, 1))
         else:
@@ -306,32 +471,14 @@ class SelfFlowDiT(nn.Module):
 
         c = t_emb + y_emb
 
-        # Determine base block class (with optional remat).
-        if self.use_remat:
-            BlockCls = nn.remat(
-                DiTBlock,
-                policy=jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
-            )
-        else:
-            BlockCls = DiTBlock
-
+        aux_pred = None
         zs = None
         block_summaries = [] if return_block_summaries else None
 
-        # use_scan compiles a single block and loops over it, dramatically
-        # reducing XLA compile-time HBM usage (O(1) graph instead of O(depth)).
-        # Block summaries / early feature extraction require the unrolled path.
-        use_scan_now = (
-            self.use_scan
-            and not return_block_summaries
-            and not return_features
-            and not return_raw_features
-        )
+        BlockCls = nn.remat(DiTBlock) if self.use_remat else DiTBlock
 
-        if use_scan_now:
-            # nn.scan expects __call__ to return (carry, output).
-            # We wrap BlockCls so it returns (x, token_mean) where token_mean
-            # is discarded here but keeps the interface clean.
+        if self.use_scan and not (return_block_summaries or return_features or return_raw_features or self.encoder_depth > 0):
+            # Scan mode: efficient but no per-block access
             class _ScanWrapper(nn.Module):
                 hidden_size: int
                 num_heads: int
@@ -346,9 +493,7 @@ class SelfFlowDiT(nn.Module):
                         mlp_ratio=self.mlp_ratio,
                         per_token=self.per_token,
                     )(x, c_step)
-                    # Return per-block activation magnitude for monitoring
-                    act_mag = jnp.mean(jnp.abs(x))
-                    return x, act_mag
+                    return x, None
 
             ScannedBlock = nn.scan(
                 _ScanWrapper,
@@ -357,22 +502,18 @@ class SelfFlowDiT(nn.Module):
                 split_rngs={"params": True, "dropout": True},
                 length=self.depth,
             )
-            # Tile c so each scan step receives one slice: (depth, *c.shape)
             c_tiled = jnp.broadcast_to(
                 jnp.expand_dims(c, 0),
                 (self.depth,) + c.shape,
             )
-            x, block_act_mags = ScannedBlock(
+            x, _ = ScannedBlock(
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 mlp_ratio=self.mlp_ratio,
                 per_token=self.per_token,
             )(x, c_tiled)
-            # block_act_mags: (depth,) — mean |activation| per block
-            self.sow('intermediates', 'block_act_magnitudes', block_act_mags)
         else:
             # Unrolled loop (needed for block summaries / feature extraction).
-            _unrolled_act_mags = []
             for i in range(self.depth):
                 x = BlockCls(
                     hidden_size=self.hidden_size,
@@ -381,33 +522,51 @@ class SelfFlowDiT(nn.Module):
                     per_token=self.per_token,
                 )(x, c)
 
-                _unrolled_act_mags.append(jnp.mean(jnp.abs(x)))
-
                 if return_block_summaries:
                     block_summaries.append(jnp.mean(x, axis=1))
 
+                # Extract features for self-distillation (Stage 2)
                 if (i + 1) == return_features:
-                    zs = self.feature_head(x)
+                    zs = self.stage2_projector(x)
                 elif (i + 1) == return_raw_features:
                     zs = x
 
-            self.sow('intermediates', 'block_act_magnitudes',
-                     jnp.stack(_unrolled_act_mags))
+                # Extract auxiliary prediction for Stage 1
+                # Matches PyTorch:
+                #   x_fea = self.projectors(out_fea.reshape(-1, D)).reshape(N, T, -1)
+                #   x_fea = self.projectors_final(x_fea)
+                #   x_fea = self.unpatchify(x_fea)
+                if self.encoder_depth > 0 and (i + 1) == self.encoder_depth:
+                    N, T, D = x.shape
+                    # Project through 3-layer MLP (per-token)
+                    aux_feat = self.aux_projectors(x.reshape(-1, D)).reshape(N, T, -1)
+                    # Final layer: LayerNorm + Linear (no adaLN)
+                    aux_pred = self.aux_final(aux_feat)
 
         x = FinalLayer(
             hidden_size=self.hidden_size,
             patch_size=self.patch_size,
             out_channels=self.out_channels_val,
-            per_token=self.per_token
+            per_token=self.per_token,
         )(x, c)
 
         x = self._shufflechannel(x)
-        
+
         # PyTorch implementation negates the final prediction
         x = -x
 
+        # Handle auxiliary prediction (same negation as main output)
+        if aux_pred is not None:
+            aux_pred = -aux_pred
+
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        # Return auxiliary prediction if Stage 1 is enabled
+        if aux_pred is not None:
+            if return_block_summaries:
+                return x, aux_pred, block_summaries
+            return x, aux_pred
 
         if return_features or return_raw_features:
             if return_block_summaries:
@@ -418,25 +577,9 @@ class SelfFlowDiT(nn.Module):
         return x
 
     def _shufflechannel(self, x):
-        """Reorder channels/patches to match expected output format."""
-        p = self.patch_size
-        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val) # equivalent to rearranging in torch
-        # wait, the PyTorch implementation says:
-        # x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels)
-        x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)
-        if self.learn_sigma:
-            x, _ = jnp.split(x, 2, axis=2)
+        """No-op: training patchify and sampling unpatchify both use (p,q,c) order.
+        
+        PyTorch uses einsum('nhwpqc->nchpwq') for unpatchify which implies
+        token dim order is already (h, w, p, q, c).
+        """
         return x
-
-
-class SelfFlowPerTokenDiT(SelfFlowDiT):
-    """
-    Self-Flow DiT with per-token timestep conditioning.
-    Main model used for Self-Flow inference on ImageNet.
-    """
-    per_token: bool = True
-
-
-# Thin alias for clarity in the vanilla SiT baseline.
-# Use as: SiTDiT(..., per_token=False)
-SiTDiT = SelfFlowDiT

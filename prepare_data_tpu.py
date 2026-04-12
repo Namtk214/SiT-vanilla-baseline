@@ -125,6 +125,169 @@ class FlatImageDataset(Dataset):
         return sample, target
 
 
+class ZipImageDataset(Dataset):
+    """Dataset that reads images directly from a zip file."""
+    def __init__(self, zip_path, samples, transform=None):
+        self.zip_path = zip_path
+        self.samples = samples
+        self.transform = transform
+        self._zf = None
+
+    def _get_zip(self):
+        """Get worker-local zip file handle."""
+        if self._zf is None:
+            self._zf = zipfile.ZipFile(self.zip_path, "r")
+        return self._zf
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        from io import BytesIO
+        member_path, target = self.samples[index]
+        zf = self._get_zip()
+        with zf.open(member_path) as f:
+            sample = Image.open(BytesIO(f.read())).convert("RGB")
+        if self.transform is not None:
+            sample = self.transform(sample)
+        return sample, target
+
+    def __del__(self):
+        if self._zf is not None:
+            self._zf.close()
+
+
+def read_text_from_zip(zip_path, member_name):
+    """Read a text file from zip archive."""
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        with zf.open(member_name) as f:
+            return f.read().decode("utf-8")
+
+
+def build_zip_manifest(zip_path):
+    """Build manifest of train/val/test samples from ImageNet zip file.
+
+    Expected zip structure:
+        ILSVRC/Data/CLS-LOC/train/<wnid>/*.JPEG
+        ILSVRC/Data/CLS-LOC/val/*.JPEG
+        ILSVRC/Data/CLS-LOC/test/*.JPEG
+        LOC_val_solution.csv
+        LOC_train_solution.csv (optional, we use folder structure)
+        LOC_synset_mapping.txt
+
+    Returns:
+        dict with keys: train_samples, val_samples, test_samples, class_to_idx, synset_mapping
+    """
+    print(f"Building zip manifest from {zip_path}...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        all_members = zf.namelist()
+
+    # Build class_to_idx from train folder structure
+    train_prefix = "ILSVRC/Data/CLS-LOC/train/"
+    wnids = set()
+    for member in all_members:
+        if member.startswith(train_prefix) and not member.endswith("/"):
+            parts = member.split("/")
+            if len(parts) >= 6:
+                wnid = parts[4]
+                wnids.add(wnid)
+    class_to_idx = {wnid: i for i, wnid in enumerate(sorted(wnids))}
+    print(f"Found {len(class_to_idx)} classes in train split.")
+
+    # Build train samples
+    train_samples = []
+    for member in all_members:
+        if member.startswith(train_prefix) and member.lower().endswith(IMAGE_EXTENSIONS):
+            parts = member.split("/")
+            if len(parts) >= 5:
+                wnid = parts[4]
+                if wnid in class_to_idx:
+                    train_samples.append((member, class_to_idx[wnid]))
+    print(f"Found {len(train_samples)} train images.")
+
+    # Build val samples from LOC_val_solution.csv
+    val_samples = []
+    val_prefix = "ILSVRC/Data/CLS-LOC/val/"
+    try:
+        csv_content = read_text_from_zip(zip_path, "LOC_val_solution.csv")
+        val_image_map = {}
+        for member in all_members:
+            if member.startswith(val_prefix) and member.lower().endswith(IMAGE_EXTENSIONS):
+                image_id = os.path.splitext(os.path.basename(member))[0]
+                val_image_map[image_id] = member
+
+        labels_by_image = {}
+        for line in csv_content.strip().split("\n")[1:]:  # Skip header
+            if not line.strip():
+                continue
+            parts = line.split(",")
+            if len(parts) >= 2:
+                image_id = parts[0]
+                prediction = parts[1].strip()
+                if prediction:
+                    synset = prediction.split()[0]
+                    if synset in class_to_idx:
+                        labels_by_image[image_id] = class_to_idx[synset]
+
+        for image_id in sorted(val_image_map):
+            if image_id in labels_by_image:
+                val_samples.append((val_image_map[image_id], labels_by_image[image_id]))
+        print(f"Found {len(val_samples)} val images with labels.")
+    except Exception as e:
+        print(f"Warning: Could not load val samples from zip: {e}")
+        val_samples = []
+
+    # Build test samples (no labels)
+    test_samples = []
+    test_prefix = "ILSVRC/Data/CLS-LOC/test/"
+    for member in all_members:
+        if member.startswith(test_prefix) and member.lower().endswith(IMAGE_EXTENSIONS):
+            test_samples.append((member, -1))
+    print(f"Found {len(test_samples)} test images.")
+
+    # Load synset mapping (optional)
+    synset_mapping = {}
+    try:
+        synset_content = read_text_from_zip(zip_path, "LOC_synset_mapping.txt")
+        for line in synset_content.strip().split("\n"):
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2:
+                synset_mapping[parts[0]] = parts[1]
+        print(f"Loaded {len(synset_mapping)} synset mappings.")
+    except Exception as e:
+        print(f"Warning: Could not load synset mapping: {e}")
+
+    return {
+        "train_samples": train_samples,
+        "val_samples": val_samples,
+        "test_samples": test_samples,
+        "class_to_idx": class_to_idx,
+        "synset_mapping": synset_mapping,
+    }
+
+
+def extract_zip_if_needed(zip_path, extract_root, reuse_extracted=True):
+    """Extract zip file to staging directory if needed.
+
+    Returns:
+        Path to extracted CLS-LOC directory
+    """
+    cls_loc_root = os.path.join(extract_root, "ILSVRC", "Data", "CLS-LOC")
+
+    if reuse_extracted and os.path.isdir(cls_loc_root):
+        print(f"Reusing existing extracted data at {cls_loc_root}")
+        return cls_loc_root
+
+    print(f"Extracting {zip_path} to {extract_root}...")
+    os.makedirs(extract_root, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_root)
+
+    print(f"Extraction complete: {cls_loc_root}")
+    return cls_loc_root
+
+
 def resolve_split_dir(data_dir, split):
     split_dir_candidate = os.path.join(data_dir, split)
     if os.path.isdir(split_dir_candidate):
@@ -210,33 +373,54 @@ def load_flat_split_samples(split_dir, split, data_dir):
 
     return [(image_map[image_id], labels_by_image[image_id]) for image_id in sorted(image_map)]
 
-def get_dataloader(data_dir, split, batch_size, num_workers=4):
-    split_dir = resolve_split_dir(data_dir, split)
+def get_dataloader(data_dir, split, batch_size, num_workers=4, zip_source=None):
+    """Create DataLoader from either directory or zip source.
 
+    Args:
+        data_dir: Base directory (used when zip_source is None)
+        split: Split name (train/val/test)
+        batch_size: Batch size
+        num_workers: Number of workers
+        zip_source: Optional dict with zip manifest data
+
+    Returns:
+        (dataloader, num_samples)
+    """
     transform = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(256),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
     ])
-    print(f"Scanning directory {split_dir} (Fast parallel scan for Kaggle)...")
-    class_dirs = [d.name for d in os.scandir(split_dir) if d.is_dir()] if os.path.isdir(split_dir) else []
-    if class_dirs:
-        dataset = FastImageFolder(split_dir, transform=transform)
+
+    if zip_source is not None:
+        # Use zip source
+        zip_path = zip_source["zip_path"]
+        manifest = zip_source["manifest"]
+        samples = manifest[f"{split}_samples"]
+        print(f"Creating ZipImageDataset for {split} with {len(samples)} images from zip.")
+        dataset = ZipImageDataset(zip_path, samples, transform=transform)
     else:
-        dataset = FlatImageDataset(load_flat_split_samples(split_dir, split, data_dir), transform=transform)
+        # Use directory source
+        split_dir = resolve_split_dir(data_dir, split)
+        print(f"Scanning directory {split_dir} (Fast parallel scan for Kaggle)...")
+        class_dirs = [d.name for d in os.scandir(split_dir) if d.is_dir()] if os.path.isdir(split_dir) else []
+        if class_dirs:
+            dataset = FastImageFolder(split_dir, transform=transform)
+        else:
+            dataset = FlatImageDataset(load_flat_split_samples(split_dir, split, data_dir), transform=transform)
+
     if len(dataset) == 0:
         raise RuntimeError(
             "No images found for encoding. "
-            f"Resolved directory: {split_dir}. "
-            "If you passed a split folder already, keep --split matching that folder (e.g. --split train)."
+            f"Check your data source configuration."
         )
-    
+
     # Batch size needs to be perfectly divisible by drop_last for JAX splitting
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=True, 
+        shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True # Keep perfectly shaped batches for JAX
@@ -363,6 +547,7 @@ def run_encoding(
     vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
+    zip_source=None,
 ):
     validate_dependencies()
     os.makedirs(output_dir, exist_ok=True)
@@ -388,24 +573,29 @@ def run_encoding(
     def encode_fn(images, params):
         # Flax models from Diffusers (with from_pt=True) expect NCHW input format,
         # otherwise they mistake the Height dimension for the Channel dimension.
-        
-        # Apply VAE
+
+        # Apply VAE to get distribution moments
         latent_dist = vae.apply({"params": params}, images, method=vae.encode).latent_dist
-        
-        # Using MEAN instead of random sampling to make it deterministic 
-        # (similar to stable diffusion training latents cache)
-        latents_nhwc = latent_dist.mean * SCALE_FACTOR
-        
+
+        # Get both mean and logvar for Self-Transcendence training
+        mean_nhwc = latent_dist.mean * SCALE_FACTOR
+        logvar_nhwc = latent_dist.logvar  # Don't scale logvar
+
         # Diffusers Flax VAE outputs latents in NHWC. Let's transpose back to NCHW for matching the standard.
-        latents_nchw = jnp.transpose(latents_nhwc, (0, 3, 1, 2))
-        return latents_nchw
+        mean_nchw = jnp.transpose(mean_nhwc, (0, 3, 1, 2))
+        logvar_nchw = jnp.transpose(logvar_nhwc, (0, 3, 1, 2))
+
+        # Concatenate mean and logvar along channel dimension
+        # moments shape: (B, 8, 32, 32) where first 4 channels are mean, last 4 are logvar
+        moments_nchw = jnp.concatenate([mean_nchw, logvar_nchw], axis=1)
+        return moments_nchw
 
     # Replicate PMAP Params across devices
     from flax.jax_utils import replicate
     vae_params_repl = replicate(vae_params)
     
     # 3. Setup DataLoader
-    dataloader, num_samples = get_dataloader(data_dir, split, batch_size)
+    dataloader, num_samples = get_dataloader(data_dir, split, batch_size, zip_source=zip_source)
     print(f"Found {num_samples} images in {split} split.")
     
     samples_per_shard = (num_samples + num_shards - 1) // num_shards
@@ -425,15 +615,15 @@ def run_encoding(
         images_jax = jnp.array(images_np.reshape((num_devices, batch_per_device, 3, 256, 256)), dtype=jnp.bfloat16)
         
         # PMAP Encode (Executes simultaneously on all 8 TPUs)
-        latents = encode_fn(images_jax, vae_params_repl)
-        
-        # Flatten back CPU numpy (Batch, 4, 32, 32)
-        latents_np = jax.device_get(latents).reshape((-1, 4, 32, 32)).astype("float32")
+        moments = encode_fn(images_jax, vae_params_repl)
+
+        # Flatten back CPU numpy (Batch, 8, 32, 32) - concatenated mean and logvar
+        moments_np = jax.device_get(moments).reshape((-1, 8, 32, 32)).astype("float32")
         labels_np = labels.numpy()
-        
-        for latent, label in zip(latents_np, labels_np):
+
+        for moment, label in zip(moments_np, labels_np):
             payload = {
-                "latent": latent,
+                "moments": moment,  # Shape (8, 32, 32) - concatenated mean and logvar
                 "label": int(label)
             }
             serialized = pickle.dumps(payload)
@@ -462,6 +652,7 @@ def run_multi_split_encoding(
     vae_model="stabilityai/sd-vae-ft-ema",
     group_size=1,
     vae_cache=None,
+    zip_source=None,
 ):
     for split in resolve_splits(splits):
         run_encoding(
@@ -473,6 +664,7 @@ def run_multi_split_encoding(
             vae_model=vae_model,
             group_size=group_size,
             vae_cache=vae_cache,
+            zip_source=zip_source,
         )
 
 
@@ -484,7 +676,7 @@ def main():
         default=["train"],
         help="One or more splits to encode. Examples: --split train, --split train val, --split all",
     )
-    parser.add_argument("--data-dir", type=str, required=True, help="Base directory")
+    parser.add_argument("--data-dir", type=str, default=None, help="Base directory (used when --data-zip is not provided)")
     parser.add_argument("--output-dir", type=str, default="./outputs", help="Directory to save .ar files")
     parser.add_argument("--batch-size", type=int, default=128, help="Global batch size (mutiple of 8)")
     parser.add_argument("--num-shards", type=int, default=1024, help="Number of .ar shards")
@@ -500,19 +692,71 @@ def main():
             "Nếu file đã có: load thẳng, bỏ qua bước convert PyTorch."
         ),
     )
+    parser.add_argument(
+        "--data-zip",
+        type=str,
+        default=None,
+        help="Path to ImageNet zip file (ILSVRC structure). If provided, overrides --data-dir.",
+    )
+    parser.add_argument(
+        "--zip-mode",
+        type=str,
+        default="stream",
+        choices=["stream", "extract"],
+        help="How to handle zip file: 'stream' reads directly from zip, 'extract' extracts to staging dir first.",
+    )
+    parser.add_argument(
+        "--extract-root",
+        type=str,
+        default="/tmp/imagenet_extracted",
+        help="Staging directory for zip extraction (only used when --zip-mode=extract).",
+    )
+    parser.add_argument(
+        "--reuse-extracted",
+        action="store_true",
+        default=True,
+        help="Reuse existing extracted data if available (only used when --zip-mode=extract).",
+    )
 
     args = parser.parse_args()
+
+    # Resolve data source
+    zip_source = None
+    data_dir = args.data_dir
+
+    if args.data_zip is not None:
+        if args.zip_mode == "stream":
+            print(f"[prepare_data_tpu] Using zip streaming mode from {args.data_zip}")
+            manifest = build_zip_manifest(args.data_zip)
+            zip_source = {
+                "zip_path": args.data_zip,
+                "manifest": manifest,
+            }
+            data_dir = None  # Not used in zip mode
+        else:  # extract mode
+            print(f"[prepare_data_tpu] Using zip extract mode to {args.extract_root}")
+            cls_loc_root = extract_zip_if_needed(
+                args.data_zip,
+                args.extract_root,
+                reuse_extracted=args.reuse_extracted,
+            )
+            data_dir = os.path.dirname(cls_loc_root)  # ILSVRC/Data
+            zip_source = None
+    elif data_dir is None:
+        raise ValueError("Either --data-dir or --data-zip must be provided.")
+
     splits = resolve_splits(args.split)
     print(f"[prepare_data_tpu] Encoding splits: {', '.join(splits)}")
     run_multi_split_encoding(
         splits=splits,
-        data_dir=args.data_dir,
+        data_dir=data_dir,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         num_shards=args.num_shards,
         group_size=args.group_size,
         vae_model=args.vae_model,
         vae_cache=args.vae_cache,
+        zip_source=zip_source,
     )
 
 if __name__ == "__main__":

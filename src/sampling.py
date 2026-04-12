@@ -175,7 +175,7 @@ def create_transport(path_type='Linear', prediction="velocity", loss_weight=None
     path_choice = {"Linear": PathType.LINEAR}
     path_type = path_choice[path_type]
     train_eps = 0.0
-    sample_eps = 0.0
+    sample_eps = 1e-5  # Avoid singularity at t=0 in SDE score (1/t diverges)
     return Transport(model_type=model_type, path_type=path_type, loss_type=loss_type, train_eps=train_eps, sample_eps=sample_eps)
 
 
@@ -310,56 +310,122 @@ def denoise_loop(
     cfg_scale=None,
     guidance_low=0.0,
     guidance_high=1.0,
-    mode="SDE",
+    mode="ODE",
     sampling_method="euler",
     reverse: bool = True,
 ):
-    args = Config()
-    args.num_steps = num_steps
-    transport = create_transport(
-        args.transport.path_type,
-        args.transport.prediction,
-        args.transport.loss_weight,
-        args.transport.train_eps,
-        args.transport.sample_eps,
-    )
+    """Denoise loop matching the original Self-Transcendence sampler.
 
-    if mode == "SDE":
-        sampler = FixedSampler(transport)
-        sample_fn = sampler.sample_sde(
-            sampling_method=args.sde.sampling_method,
-            diffusion_form=args.sde.diffusion_form,
-            diffusion_norm=args.sde.diffusion_norm,
-            last_step=args.sde.last_step,
-            last_step_size=args.sde.last_step_size,
-            num_steps=args.num_steps,
-        )
-    else:
-        raise NotImplementedError("Only SDE mode is currently supported")
+    Our training convention:
+        tau=0 is noise, tau=1 is data.
+        model predicts velocity = data - noise (after internal 1-t and -x).
 
-    def wrapped_model_fn(z, t):
-        t_orig = t
-        t = 1.0 - t if reverse else t
+    Original Self-Transcendence convention:
+        t=0 is data, t=1 is noise.
+        model predicts velocity = -data + noise.
+        Euler sampler: t goes 1→0, dt < 0.
+        x_next = x_cur + (t_next - t_cur) * model(x_cur, t_cur)
+
+    In our convention (tau = 1 - t):
+        tau goes 0→1, dt > 0.
+        x_next = x_cur + dt * model(x_cur, tau_cur)
+    """
+
+    # Time schedule: tau goes from 0 (noise) to 1 (data)
+    tau_steps = jnp.linspace(0.0, 1.0, num_steps + 1, dtype=jnp.float64)
+
+    def euler_step(x_cur, tau_pair):
+        tau_cur, tau_next = tau_pair
+        dt = tau_next - tau_cur
+        t_batch = jnp.ones(x_cur.shape[0], dtype=jnp.float32) * tau_cur.astype(jnp.float32)
+
+        d_cur = model_fn(x_cur.astype(jnp.float32), t_batch)
 
         if cfg_scale is not None and cfg_scale > 1.0:
-            apply_cfg = jnp.all((guidance_low <= t) & (t <= guidance_high))
-            
-            def true_fn(z_true):
-                bs = z_true.shape[0]
-                z_half = z_true[bs // 2:]
-                z_in = jnp.concatenate((z_half, z_half), axis=0)
-                pred = model_fn(z_in, t)
-                pred_cfg = vanilla_guidance(pred, cfg_scale)
-                return jnp.concatenate((pred_cfg, pred_cfg), axis=0)
+            # Model input was concatenated as [null_labels, real_labels] in train.py
+            # So first half = uncond predictions, second half = cond predictions
+            d_uncond, d_cond = jnp.split(d_cur, 2, axis=0)
+            # Apply guidance within the specified range
+            # In our convention: tau_cur corresponds to original t = 1 - tau_cur
+            # guidance_low/high are in original t convention
+            t_orig = 1.0 - tau_cur
+            apply_cfg = (t_orig >= guidance_low) & (t_orig <= guidance_high)
+            d_guided = d_uncond + cfg_scale * (d_cond - d_uncond)
+            d_cur = jnp.where(apply_cfg, d_guided, d_cond)
+            d_cur = jnp.concatenate([d_cur, d_cur], axis=0)
 
-            def false_fn(z_false):
-                return model_fn(z_false, t)
+        x_next = x_cur + dt.astype(x_cur.dtype) * d_cur
+        return x_next, x_next
 
-            pred = jax.lax.cond(apply_cfg, true_fn, false_fn, z)
-        else:
-            pred = model_fn(z, t)
+    if mode == "SDE":
+        # Euler-Maruyama SDE (matches original euler_maruyama_sampler)
+        # SDE: dx = [v - 0.5 * diffusion * score] dt + sqrt(diffusion) * dW
+        # where diffusion = 2 * t_orig = 2 * (1 - tau)
+        # score = (alpha_t/d_alpha_t * v - x) / var
+        # For last step: use ODE (no noise)
+        last_step_tau = 1.0 - 0.04  # = 0.96, corresponds to original t=0.04
+        main_steps = num_steps
+        tau_main = jnp.linspace(0.0, last_step_tau, main_steps, dtype=jnp.float64)
 
-        return -pred if reverse else pred
+        def sde_step(carry, tau_pair):
+            x_cur, rng_cur = carry
+            tau_cur, tau_next = tau_pair
+            dt = tau_next - tau_cur
+            rng_cur, step_rng = jax.random.split(rng_cur)
+            eps = jax.random.normal(step_rng, x_cur.shape)
 
-    samples = sample_fn(x, rng, wrapped_model_fn)
-    return samples[-1]
+            t_batch = jnp.ones(x_cur.shape[0], dtype=jnp.float32) * tau_cur.astype(jnp.float32)
+            v_cur = model_fn(x_cur.astype(jnp.float32), t_batch)
+
+            if cfg_scale is not None and cfg_scale > 1.0:
+                v_cond, v_uncond = jnp.split(v_cur, 2, axis=0)
+                t_orig = 1.0 - tau_cur
+                apply_cfg = (t_orig >= guidance_low) & (t_orig <= guidance_high)
+                v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
+                v_cur_cfg = jnp.where(apply_cfg, v_guided, v_cond)
+                v_cur = jnp.concatenate([v_cur_cfg, v_cur_cfg], axis=0)
+
+            # In our convention: alpha_t = tau, sigma_t = 1-tau
+            # t_orig = 1 - tau, diffusion_orig = 2 * t_orig = 2 * (1 - tau)
+            tau_f = tau_cur.astype(jnp.float32)
+            diffusion = 2.0 * (1.0 - tau_f)  # matches original compute_diffusion(t) = 2*t
+            # score from velocity: score = (tau*v - x) / (1-tau)
+            tau_expand = jnp.broadcast_to(tau_f, x_cur.shape)
+            sigma_expand = jnp.broadcast_to(1.0 - tau_f, x_cur.shape)
+            score = (tau_expand * v_cur - x_cur) / jnp.maximum(sigma_expand, 1e-5)
+
+            # SDE drift: v - 0.5 * diffusion * score (matches original)
+            d_cur = v_cur - 0.5 * diffusion * score
+            deps = eps * jnp.sqrt(jnp.abs(dt.astype(jnp.float32)))
+            x_next = x_cur + d_cur * dt.astype(x_cur.dtype) + jnp.sqrt(jnp.maximum(diffusion, 0.0)) * deps
+
+            return (x_next, rng_cur), x_next
+
+        tau_pairs = jnp.stack([tau_main[:-1], tau_main[1:]], axis=1)
+        (x_last, _), _ = jax.lax.scan(sde_step, (x, rng), tau_pairs)
+
+        # Last step: ODE (deterministic mean)
+        t_batch = jnp.ones(x_last.shape[0], dtype=jnp.float32) * last_step_tau
+        v_last = model_fn(x_last.astype(jnp.float32), t_batch)
+        if cfg_scale is not None and cfg_scale > 1.0:
+            v_cond, v_uncond = jnp.split(v_last, 2, axis=0)
+            t_orig = 1.0 - last_step_tau
+            apply_cfg = (t_orig >= guidance_low) & (t_orig <= guidance_high)
+            v_guided = v_uncond + cfg_scale * (v_cond - v_uncond)
+            v_last_cfg = jnp.where(apply_cfg, v_guided, v_cond)
+            v_last = jnp.concatenate([v_last_cfg, v_last_cfg], axis=0)
+
+        diffusion_last = 2.0 * (1.0 - last_step_tau)
+        tau_expand = jnp.broadcast_to(jnp.float32(last_step_tau), x_last.shape)
+        sigma_expand = jnp.broadcast_to(jnp.float32(1.0 - last_step_tau), x_last.shape)
+        score_last = (tau_expand * v_last - x_last) / jnp.maximum(sigma_expand, 1e-5)
+        d_last = v_last - 0.5 * diffusion_last * score_last
+        dt_last = 1.0 - last_step_tau
+        return x_last + d_last * dt_last
+
+    else:
+        # Simple Euler ODE (matches original euler_sampler exactly)
+        tau_pairs = jnp.stack([tau_steps[:-1], tau_steps[1:]], axis=1)
+        _, samples = jax.lax.scan(euler_step, x, tau_pairs)
+        return samples[-1]
+
