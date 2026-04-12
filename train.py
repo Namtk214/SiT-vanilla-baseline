@@ -282,14 +282,26 @@ def _build_flax_vae_decode_fn(vae_model_path, num_devices, hf_config_id="stabili
             vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
             vae = FlaxAutoencoderKL.from_config(_get_vae_config())
     else:
-        chosen_zip = zip_files[0]
-        log_stage(f"[VAE-TPU] Loading từ zip: {os.path.basename(chosen_zip)}…")
-        with zipfile.ZipFile(chosen_zip, "r") as zf:
-            msgpack_name = next((n for n in zf.namelist() if n.endswith(".msgpack")), None)
-            if msgpack_name is None:
-                log_stage("[VAE-TPU] Zip không chứa .msgpack, fallback về CPU subprocess.")
-                return None, None
-            params_bytes = zf.read(msgpack_name)
+        # Prioritize zips with 'vae' in filename, then try all others
+        sorted_zips = sorted(zip_files, key=lambda f: (0 if 'vae' in os.path.basename(f).lower() else 1, f))
+        chosen_zip = None
+        params_bytes = None
+        for zp in sorted_zips:
+            log_stage(f"[VAE-TPU] Trying zip: {os.path.basename(zp)}…")
+            try:
+                with zipfile.ZipFile(zp, "r") as zf:
+                    msgpack_name = next((n for n in zf.namelist() if n.endswith(".msgpack")), None)
+                    if msgpack_name is not None:
+                        params_bytes = zf.read(msgpack_name)
+                        chosen_zip = zp
+                        log_stage(f"[VAE-TPU] Found .msgpack in {os.path.basename(zp)}: {msgpack_name}")
+                        break
+            except Exception as exc:
+                log_stage(f"[VAE-TPU] Cannot read {os.path.basename(zp)}: {exc}")
+                continue
+        if chosen_zip is None or params_bytes is None:
+            log_stage("[VAE-TPU] No zip contains .msgpack, fallback về CPU subprocess.")
+            return None, None
         vae_params = flax.serialization.from_bytes(None, params_bytes)
         vae_params = jax.tree_util.tree_map(jnp.array, vae_params)
         vae = FlaxAutoencoderKL.from_config(_get_vae_config())
@@ -344,10 +356,61 @@ def resolve_arrayrecord_paths(data_pattern):
     )
 
 
+def moments_to_latents_nchw(data):
+    """Convert raw moments (B,8,H,W) to latents (B,4,H,W) using mean channels.
+
+    Also handles already-latent data (B,4,H,W) as passthrough.
+    """
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 4 and data.shape[1] == 8:
+        # Moments: take mean (first 4 channels)
+        return data[:, :4, :, :]
+    elif data.ndim == 4 and data.shape[1] == 4:
+        # Already latents
+        return data
+    else:
+        raise ValueError(f"Expected (B,8,H,W) moments or (B,4,H,W) latents, got shape {data.shape}")
+
+
+def val_batch_to_patchified(data, n_patches, patch_dim, stage=None):
+    """Convert val batch data to patchified tokens (B, N, D).
+
+    Handles:
+    - (B, 8, H, W) moments → extract mean → patchify
+    - (B, 4, H, W) latents → patchify
+    - (B, N, D) already patchified → passthrough
+    """
+    data = np.asarray(data, dtype=np.float32)
+    if data.ndim == 3:
+        # Already patchified (B, N, D)
+        return data
+    elif data.ndim == 4:
+        # NCHW data: moments (8ch) or latents (4ch)
+        latents = moments_to_latents_nchw(data)
+        b, c, h, w = latents.shape
+        p = 2
+        latents = np.reshape(latents, (b, c, h // p, p, w // p, p))
+        latents = np.transpose(latents, (0, 2, 4, 3, 5, 1))
+        tokens = np.reshape(latents, (b, (h // p) * (w // p), p * p * c))
+        return tokens
+    else:
+        raise ValueError(f"Unexpected val data shape: {data.shape}")
+
+
 def unpatchify_patchified_latents(latents):
+    """Convert patchified/moments/latent data to NCHW latents (B,4,H,W).
+
+    Handles:
+    - (B, N, D) patchified tokens → unpatchify
+    - (B, 8, H, W) moments → extract mean
+    - (B, 4, H, W) latents → passthrough
+    """
     from einops import rearrange
 
     latents = np.asarray(latents, dtype=np.float32)
+    if latents.ndim == 4:
+        # NCHW: moments or latents
+        return moments_to_latents_nchw(latents)
     return rearrange(
         latents,
         "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
@@ -576,6 +639,8 @@ def eval_step(
         vector=y,
         deterministic=True,
     )
+    # stage1/stage2 model returns (velocity, aux_features), extract velocity
+    pred = pred[0] if isinstance(pred, (tuple, list)) else pred
     loss = jnp.mean((pred - target) ** 2)
     v_abs_mean = jnp.mean(jnp.abs(target))
     v_pred_abs_mean = jnp.mean(jnp.abs(pred))
@@ -748,6 +813,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        encoder_depth=config.get("encoder_depth", -1),
+        projector_dim=config.get("projector_dim", config["hidden_size"]),
         dropout_prob=config.get("dropout_prob", 0.0),
     )
 
@@ -787,13 +854,15 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             )
 
         def model_fn(z_x, t):
-            return model.apply(
+            out = model.apply(
                 {"params": params},
                 z_x,
                 timesteps=t,
                 vector=class_labels,
                 deterministic=True,
             )
+            # stage1/stage2: (velocity, aux) tuple -> extract velocity
+            return out[0] if isinstance(out, (tuple, list)) else out
 
         rng, denoise_rng = jax.random.split(rng)
         samples = denoise_loop(
@@ -804,7 +873,7 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
             cfg_scale=cfg_scale,
             guidance_low=0.0,
             guidance_high=0.7,
-            mode="SDE",
+            mode="ODE",
             reverse=False,   # training: tau=0→noise, tau=1→data → integrate forward
         )
 
@@ -854,6 +923,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        encoder_depth=config.get("encoder_depth", -1),
+        projector_dim=config.get("projector_dim", config["hidden_size"]),
         dropout_prob=config.get("dropout_prob", 0.0),
     )
 
@@ -889,13 +960,15 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
             )
 
         def model_fn(z_x, t):
-            return model.apply(
+            out = model.apply(
                 {"params": ema_params_local},
                 z_x,
                 timesteps=t,
                 vector=class_labels_local,
                 deterministic=True,
             )
+            # stage1/stage2: (velocity, aux) tuple -> extract velocity
+            return out[0] if isinstance(out, (tuple, list)) else out
 
         rng_local, denoise_rng = jax.random.split(rng_local)
         samples = denoise_loop(
@@ -906,7 +979,7 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
             cfg_scale=cfg_scale,
             guidance_low=0.0,
             guidance_high=0.7,
-            mode="SDE",
+            mode="ODE",
             reverse=False,
         )
 
@@ -1328,6 +1401,11 @@ def main():
         raise ValueError("--t-range must be [t_min, t_max] where 0 <= t_min < t_max <= 1")
 
     # ── Multi-worker TPU initialization ───────────────────────────────────────
+    # For multi-host TPU (e.g. v4-16 with 2 workers), JAX needs
+    # distributed initialization before any device queries.
+    jax.distributed.initialize()
+    log_stage(f"jax.distributed.initialize() complete")
+
     _tpu_init_attempts = 3
     for _attempt in range(_tpu_init_attempts):
         try:
@@ -1425,7 +1503,7 @@ def main():
     state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
-    rng = jax.random.split(rng, num_devices)
+    rng = jax.random.split(rng, num_local_devices)
     ema_decay_rep = jax_utils.replicate(jnp.float32(args.ema_decay))
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -1562,7 +1640,7 @@ def main():
     data_iterator = None
     try:
         dataloader = get_arrayrecord_dataloader(
-            data_pattern=args.data_path, batch_size=args.batch_size, is_training=True
+            data_pattern=args.data_path, batch_size=per_worker_batch, is_training=True
         )
         data_iterator = iter(dataloader)
     except Exception as e:
@@ -1583,7 +1661,7 @@ def main():
     if args.val_data_path is not None:
         try:
             val_iterator = create_data_iterator(
-                data_pattern=args.val_data_path, batch_size=args.batch_size, is_training=False
+                data_pattern=args.val_data_path, batch_size=per_worker_batch, is_training=False
             )
         except Exception as e:
             log_stage(f"Validation disabled. {e}")
@@ -1597,7 +1675,7 @@ def main():
 
     def _ensure_vae_backend():
         if _flax_decode_cache[0] is None:
-            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_devices, args.vae_hf_config)
+            decode_fn, params_repl = _build_flax_vae_decode_fn(args.vae_model, num_local_devices, args.vae_hf_config)
             if decode_fn is not None:
                 _flax_decode_cache[0] = (decode_fn, params_repl)
             else:
@@ -1610,14 +1688,14 @@ def main():
         """NCHW float32 → NHWC float32 [0, 1] trên TPU, tự pad cho chia hết num_devices."""
         latents_nchw = np.asarray(latents_nchw, dtype=np.float32)
         n = latents_nchw.shape[0]
-        pad = (num_devices - n % num_devices) % num_devices
+        pad = (num_local_devices - n % num_local_devices) % num_local_devices
         if pad > 0:
             latents_nchw = np.concatenate(
                 [latents_nchw, np.zeros((pad, 4, 32, 32), dtype=np.float32)], axis=0
             )
-        batch_per_device = latents_nchw.shape[0] // num_devices
+        batch_per_device = latents_nchw.shape[0] // num_local_devices
         latents_sharded = jnp.array(
-            latents_nchw.reshape(num_devices, batch_per_device, 4, 32, 32),
+            latents_nchw.reshape(num_local_devices, batch_per_device, 4, 32, 32),
             dtype=jnp.bfloat16,
         )
         images = decode_fn(latents_sharded, params_repl)  # (devices, bpd, H, W, 3)
@@ -1642,7 +1720,7 @@ def main():
             # Host bounce fallback: bring latents to host, decode, then reshape back.
             latents = np.asarray(jax.device_get(latents_nchw_sharded), dtype=np.float32).reshape(-1, 4, 32, 32)
             imgs = backend.decode(latents)  # (global, 256,256,3)
-            return jnp.array(imgs.reshape(num_devices, -1, 256, 256, 3), dtype=jnp.float32)
+            return jnp.array(imgs.reshape(num_local_devices, -1, 256, 256, 3), dtype=jnp.float32)
         decode_fn, params_repl = backend
         latents_bf16 = latents_nchw_sharded.astype(jnp.bfloat16)
         return decode_fn(latents_bf16, params_repl)
@@ -1871,8 +1949,9 @@ def main():
         probe_layer = int(args.probe_layer if args.probe_layer is not None else depth)
         W_repl, b_repl = get_probe_weights()
         probe_fn = get_probe_pmapped(probe_layer)
-        bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-        by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
+        bx_tok = val_batch_to_patchified(batch_x_patchified, n_patches, patch_dim, stage=args.stage)
+        bx = jnp.array(bx_tok).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(batch_y).reshape(num_local_devices, local_batch_size)
         corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
         correct_total = int(jax.device_get(corr[0]))
         count_total = int(jax.device_get(tot[0]))
@@ -1882,8 +1961,9 @@ def main():
 
     def run_preflight_block_corr(batch_x_patchified, batch_y):
         bc_fn = get_blockcorr_pmapped()
-        bx = jnp.array(batch_x_patchified).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-        by = jnp.array(batch_y).reshape(num_devices, local_batch_size)
+        bx_tok = val_batch_to_patchified(batch_x_patchified, n_patches, patch_dim, stage=args.stage)
+        bx = jnp.array(bx_tok).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(batch_y).reshape(num_local_devices, local_batch_size)
         summaries = bc_fn(ema_params, bx, by)  # (devices, local_batch, depth, hidden)
         summaries_h = np.asarray(jax.device_get(summaries), dtype=np.float32).transpose(2, 0, 1, 3)
         stacked = summaries_h.reshape(summaries_h.shape[0], -1, summaries_h.shape[-1])
@@ -1906,8 +1986,12 @@ def main():
         inception_local_batch = int(args.fid_eval_local_batch)
 
         log_stage("[FID probe] running one discarded train step to match training-time memory...")
-        probe_x = jnp.array(cached_train_batch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-        probe_y = jnp.array(cached_train_batch[1]).reshape(num_devices, local_batch_size)
+        if args.stage in ["stage1", "stage2"]:
+            probe_x = jnp.array(cached_train_batch[0]).reshape(num_local_devices, local_batch_size, 8, 32, 32)
+        else:
+            probe_x_patchified = val_batch_to_patchified(cached_train_batch[0], n_patches, patch_dim)
+            probe_x = jnp.array(probe_x_patchified).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+        probe_y = jnp.array(cached_train_batch[1]).reshape(num_local_devices, local_batch_size)
         _, _, probe_metrics, _ = pmapped_train_step(
             state, ema_params, (probe_x, probe_y), rng, ema_decay_rep
         )
@@ -1920,14 +2004,14 @@ def main():
             f"with VAE micro-batch {args.vae_decode_batch_size}..."
         )
         probe_val_batch, val_data_iter = next_validation_batch(
-            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            val_data_iter, data_pattern=args.val_data_path, batch_size=per_worker_batch
         )
         real_latents_nchw = unpatchify_patchified_latents(probe_val_batch[0])
         real_images = decode_latents_batched(real_latents_nchw, args.vae_decode_batch_size)
         extract_inception_features_host_images(
             real_images,
             inception_fn,
-            num_devices=num_devices,
+            num_devices=num_local_devices,
             local_batch=inception_local_batch,
             mode="pooled+spatial",
         )
@@ -1948,7 +2032,7 @@ def main():
         extract_inception_features_host_images(
             fake_images,
             inception_fn,
-            num_devices=num_devices,
+            num_devices=num_local_devices,
             local_batch=inception_local_batch,
             mode="pooled+spatial",
         )
@@ -1969,7 +2053,7 @@ def main():
         from src.fid_utils import fid_from_stats
 
         local_b = int(args.fid_eval_local_batch)
-        global_b = num_devices * local_b
+        global_b = num_local_devices * local_b
         need = int(args.num_fid_samples)
         current_val_iter = val_data_iter
 
@@ -1983,8 +2067,8 @@ def main():
         pr_mode = "full" if pr_full else ("subset" if pr_eval_samples < need else "full")
 
         def _update_accumulators(acc_pooled, acc_spatial, pooled_feats, spatial_feats, valid_mask):
-            pooled = pooled_feats.reshape(num_devices, local_b, 2048)
-            spatial = spatial_feats.reshape(num_devices, local_b, spatial_feats.shape[2], spatial_feats.shape[3], 2048)
+            pooled = pooled_feats.reshape(num_local_devices, local_b, 2048)
+            spatial = spatial_feats.reshape(num_local_devices, local_b, spatial_feats.shape[2], spatial_feats.shape[3], 2048)
             bc, bs, bsxx = gaussian_batch_sums_pmap(pooled, valid_mask)
             sc, ss, ssxx = gaussian_spatial_batch_sums_pmap(spatial, valid_mask)
             # Use replica 0 (all replicas identical after psum)
@@ -2001,7 +2085,7 @@ def main():
             seen = 0
             while seen < need and current_val_iter is not None:
                 vbatch, current_val_iter = next_validation_batch(
-                    current_val_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                    current_val_iter, data_pattern=args.val_data_path, batch_size=per_worker_batch
                 )
                 latents_all = unpatchify_patchified_latents(vbatch[0])  # (B,4,32,32) numpy
                 # Stream through this batch in fixed global_b chunks
@@ -2013,7 +2097,7 @@ def main():
                     if chunk.shape[0] < global_b:
                         pad = global_b - chunk.shape[0]
                         chunk = np.concatenate([chunk, np.zeros((pad, 4, 32, 32), dtype=np.float32)], axis=0)
-                    lat_sharded = jnp.array(chunk.reshape(num_devices, local_b, 4, 32, 32), dtype=jnp.float32)
+                    lat_sharded = jnp.array(chunk.reshape(num_local_devices, local_b, 4, 32, 32), dtype=jnp.float32)
                     imgs_sharded = decode_latents_sharded(lat_sharded)  # (dev,local,256,256,3)
                     pooled, spatial, valid_mask = apply_inception_to_decoded_sharded(
                         imgs_sharded,
@@ -2149,10 +2233,11 @@ def main():
                 if probe_iter is None:
                     break
                 vbatch, probe_iter = next_validation_batch(
-                    probe_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                    probe_iter, data_pattern=args.val_data_path, batch_size=per_worker_batch
                 )
-                bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+                bx_tok = val_batch_to_patchified(vbatch[0], n_patches, patch_dim, stage=args.stage)
+                bx = jnp.array(bx_tok).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+                by = jnp.array(vbatch[1]).reshape(num_local_devices, local_batch_size)
                 corr, tot = probe_fn(ema_params, bx, by, W_repl, b_repl)
                 correct_total += int(jax.device_get(corr[0]))
                 count_total += int(jax.device_get(tot[0]))
@@ -2184,10 +2269,11 @@ def main():
         block_batches = []
         for i in range(int(args.block_corr_batches)):
             vbatch, val_data_iter = next_validation_batch(
-                val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+                val_data_iter, data_pattern=args.val_data_path, batch_size=per_worker_batch
             )
-            bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-            by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+            bx_tok = val_batch_to_patchified(vbatch[0], n_patches, patch_dim, stage=args.stage)
+            bx = jnp.array(bx_tok).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+            by = jnp.array(vbatch[1]).reshape(num_local_devices, local_batch_size)
             summaries = bc_fn(ema_params, bx, by)
             summaries_h = np.asarray(jax.device_get(summaries), dtype=np.float32)
             summaries_h = np.transpose(summaries_h, (1, 0, 2, 3))
@@ -2219,10 +2305,11 @@ def main():
 
         # Get one fixed batch for visualization
         vbatch, val_data_iter = next_validation_batch(
-            val_data_iter, data_pattern=args.val_data_path, batch_size=args.batch_size
+            val_data_iter, data_pattern=args.val_data_path, batch_size=per_worker_batch
         )
-        bx = jnp.array(vbatch[0]).reshape(num_devices, local_batch_size, n_patches, patch_dim)
-        by = jnp.array(vbatch[1]).reshape(num_devices, local_batch_size)
+        bx_patchified = val_batch_to_patchified(vbatch[0], n_patches, patch_dim, stage=args.stage)
+        bx = jnp.array(bx_patchified).reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+        by = jnp.array(vbatch[1]).reshape(num_local_devices, local_batch_size)
 
         # Token grid dimensions for reshaping
         token_grid_size = int(n_patches ** 0.5)
@@ -2273,7 +2360,7 @@ def main():
         preflight_real_batch = None
         if val_iterator is not None:
             preflight_batch, val_iterator = next_validation_batch(
-                val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                val_iterator, data_pattern=args.val_data_path, batch_size=per_worker_batch,
             )
             preflight_real_batch = preflight_batch
         elif data_iterator is not None:
@@ -2290,7 +2377,7 @@ def main():
             real_eval_batch=preflight_real_batch,
             preflight_sample_count=args.preflight_sample_count,
             preflight_fid_samples=args.preflight_fid_samples,
-            inception_num_devices=num_devices,
+            inception_num_devices=num_local_devices,
             inception_local_batch=args.fid_eval_local_batch,
             inception_score_enabled=bool(args.inception_score),
             inception_score_splits=int(args.inception_score_splits),
@@ -2329,17 +2416,17 @@ def main():
                 rng_mock, = jax.random.split(rng[0], 1)
                 if args.stage in ["stage1", "stage2"]:
                     # Mock moments data
-                    batch_x = jax.random.normal(rng_mock, (args.batch_size, 8, 32, 32))
+                    batch_x = jax.random.normal(rng_mock, (per_worker_batch, 8, 32, 32))
                 else:
                     # Mock latent data
-                    batch_x = jax.random.normal(rng_mock, (args.batch_size, 4, 32, 32))
-                batch_y = jax.random.randint(rng_mock, (args.batch_size,), 0, 1000)
+                    batch_x = jax.random.normal(rng_mock, (per_worker_batch, 4, 32, 32))
+                batch_y = jax.random.randint(rng_mock, (per_worker_batch,), 0, 1000)
 
             # Process batch based on stage
             if args.stage in ["stage1", "stage2"]:
                 # For Self-Transcendence stages: batch_x is moments (B, 8, H, W)
                 # Will be sampled and patchified in train step
-                batch_x = batch_x.reshape(num_devices, local_batch_size, 8, 32, 32)
+                batch_x = batch_x.reshape(num_local_devices, local_batch_size, 8, 32, 32)
             else:
                 # For vanilla: batch_x is latents (B, 4, H, W), need to patchify
                 # Patchify: (B, 4, 32, 32) -> (B, 256, 16)
@@ -2350,9 +2437,9 @@ def main():
                 batch_x_np = np.transpose(batch_x_np, (0, 2, 4, 3, 5, 1))  # (B, H//p, W//p, p, p, C)
                 batch_x_np = np.reshape(batch_x_np, (b, (h // p) * (w // p), p * p * c))
                 batch_x = jnp.array(batch_x_np)
-                batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
+                batch_x = batch_x.reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
 
-            batch_y = batch_y.reshape(num_devices, local_batch_size)
+            batch_y = batch_y.reshape(num_local_devices, local_batch_size)
 
             # Vanilla SiT training step (returns updated EMA params)
             state, ema_params, metrics, rng = pmapped_train_step(
@@ -2378,7 +2465,7 @@ def main():
                 metric_sums = {}
                 for _ in range(args.eval_batches):
                     val_batch, val_iterator = next_validation_batch(
-                        val_iterator, data_pattern=args.val_data_path, batch_size=args.batch_size,
+                        val_iterator, data_pattern=args.val_data_path, batch_size=per_worker_batch,
                     )
                     val_x = jnp.array(val_batch[0])
                     val_y = jnp.array(val_batch[1])
@@ -2407,8 +2494,8 @@ def main():
                         val_x_np = np.reshape(val_x_np, (b, (h // p) * (w // p), p * p * c))
                         val_x = jnp.array(val_x_np)
 
-                    val_x = val_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
-                    val_y = val_y.reshape(num_devices, local_batch_size)
+                    val_x = val_x.reshape(num_local_devices, local_batch_size, n_patches, patch_dim)
+                    val_y = val_y.reshape(num_local_devices, local_batch_size)
                     val_metrics, rng = pmapped_eval_step(state, ema_params, (val_x, val_y), rng)
                     host_val_metrics = replicated_metrics_to_host(val_metrics)
                     for key, value in host_val_metrics.items():
@@ -2447,20 +2534,28 @@ def main():
                 single_ema_params = jax.tree_util.tree_map(lambda w: w[0], ema_params)
                 latents_dev = sample_latents_jitted(single_ema_params, sample_classes, sample_rng)
 
-                def _bg_log(z_dev, classes, target_step):
-                    z = np.asarray(jax.device_get(z_dev), dtype=np.float32)
-                    classes = jax.device_get(classes)
+                # Decode latents synchronously on main thread (pmap must run on all workers)
+                z = np.asarray(jax.device_get(latents_dev), dtype=np.float32)
+                sample_classes_np = np.asarray(jax.device_get(sample_classes))
+                try:
                     images = decode_latents_batched(z, args.vae_decode_batch_size)
                     images = (images * 255).astype(np.uint8)
-                    safe_wandb_log({
-                        "train/step": target_step,
-                        "samples": [wandb.Image(img, caption=f"Class {cls}")
-                                    for img, cls in zip(images, classes)],
-                    }, step=target_step)
+                except Exception as exc:
+                    log_stage(f"Sample decode failed: {exc}")
+                    images = None
 
-                threading.Thread(target=_bg_log,
-                                 args=(latents_dev, sample_classes, global_step),
-                                 daemon=True).start()
+                # Only WandB logging in background thread (no TPU ops)
+                if images is not None:
+                    def _bg_log(imgs, classes, target_step):
+                        safe_wandb_log({
+                            "train/step": target_step,
+                            "samples": [wandb.Image(img, caption=f"Class {cls}")
+                                        for img, cls in zip(imgs, classes)],
+                        }, step=target_step)
+
+                    threading.Thread(target=_bg_log,
+                                     args=(images, sample_classes_np, global_step),
+                                     daemon=True).start()
 
     # ── Checkpoint save (only coordinator saves to avoid conflicts) ────────────
     if is_coordinator:

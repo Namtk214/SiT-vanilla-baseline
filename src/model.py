@@ -119,7 +119,11 @@ class LabelEmbedder(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning."""
+    """A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    adaLN modulation Dense is zero-initialized so that gates start at 0,
+    making each block an identity function at initialization (DiT convention).
+    """
     hidden_size: int
     num_heads: int
     mlp_ratio: float = 4.0
@@ -130,14 +134,17 @@ class DiTBlock(nn.Module):
         norm1 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         norm2 = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)
+        # Zero-init: gates start at 0 → block is identity at init
+        _zero = nn.initializers.zeros
         
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c_flat)
+            c_act = nn.swish(c_flat)
+            modulation_flat = nn.Dense(
+                6 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=-1)
             
@@ -156,10 +163,11 @@ class DiTBlock(nn.Module):
             ])
             x = x + gate_mlp * mlp_fn(x_norm2)
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(6 * self.hidden_size)
-            ])(c)
+            c_act = nn.swish(c)
+            modulation = nn.Dense(
+                6 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(modulation, 6, axis=1)
             
             x_norm = modulate(norm1(x), shift_msa, scale_msa)
@@ -180,7 +188,11 @@ class DiTBlock(nn.Module):
 
 
 class FinalLayer(nn.Module):
-    """The final layer of DiT."""
+    """The final layer of DiT.
+
+    Both adaLN modulation and linear projection are zero-initialized
+    so that the initial model prediction is zero (DiT convention).
+    """
     hidden_size: int
     patch_size: int
     out_channels: int
@@ -189,25 +201,32 @@ class FinalLayer(nn.Module):
     @nn.compact
     def __call__(self, x, c):
         norm_final = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=False)
-        linear = nn.Dense(self.patch_size * self.patch_size * self.out_channels)
+        _zero = nn.initializers.zeros
+        linear = nn.Dense(
+            self.patch_size * self.patch_size * self.out_channels,
+            kernel_init=_zero, bias_init=_zero,
+            name="linear",
+        )
         
         if self.per_token:
             batch_size, seq_len, hidden_dim = c.shape
             c_flat = c.reshape(-1, hidden_dim)
-            modulation_flat = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c_flat)
+            c_act = nn.swish(c_flat)
+            modulation_flat = nn.Dense(
+                2 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             modulation = modulation_flat.reshape(batch_size, seq_len, -1)
             shift, scale = jnp.split(modulation, 2, axis=-1)
             
             x = modulate_per_token(norm_final(x), shift, scale)
             x = linear(x)
         else:
-            modulation = nn.Sequential([
-                nn.swish,
-                nn.Dense(2 * self.hidden_size)
-            ])(c)
+            c_act = nn.swish(c)
+            modulation = nn.Dense(
+                2 * self.hidden_size, kernel_init=_zero, bias_init=_zero,
+                name="adaLN_modulation",
+            )(c_act)
             shift, scale = jnp.split(modulation, 2, axis=1)
             
             x = modulate(norm_final(x), shift, scale)
@@ -448,12 +467,12 @@ class SelfFlowDiT(nn.Module):
         return x
 
     def _shufflechannel(self, x):
-        """Reorder channels/patches to match expected output format."""
-        p = self.patch_size
-        x = rearrange(x, "b l (c p q) -> b l (c p q)", p=p, q=p, c=self.out_channels_val) # equivalent to rearranging in torch
-        # wait, the PyTorch implementation says:
-        # x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels)
-        x = rearrange(x, "b l (p q c) -> b l (c p q)", p=p, q=p, c=self.out_channels_val)
+        """No-op: training patchify and sampling unpatchify both use (p,q,c) order.
+
+        The original PyTorch SiT uses (c,p,q) NCHW-style token ordering, but this
+        JAX codebase patchifies as (p,q,c). Removing the shuffle ensures model
+        output matches training targets and sampling unpatchify.
+        """
         if self.learn_sigma:
             x, _ = jnp.split(x, 2, axis=2)
         return x

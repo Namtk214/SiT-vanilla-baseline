@@ -186,9 +186,9 @@ def build_zip_manifest(zip_path):
     train_prefix = "ILSVRC/Data/CLS-LOC/train/"
     wnids = set()
     for member in all_members:
-        if member.startswith(train_prefix) and member.count("/") == 4:
+        if member.startswith(train_prefix) and not member.endswith("/"):
             parts = member.split("/")
-            if len(parts) >= 5:
+            if len(parts) >= 6:
                 wnid = parts[4]
                 wnids.add(wnid)
     class_to_idx = {wnid: i for i, wnid in enumerate(sorted(wnids))}

@@ -12,25 +12,31 @@ import numpy as np
 def sample_posterior_jax(moments, rng, scale=0.18215):
     """Sample x0 from VAE posterior distribution.
 
+    Matches original Self-Transcendence: z = (mean + std * randn) * scale
+    Our data stores mean_scaled = mean * scale and logvar (unscaled).
+    So: z = mean_scaled + scale * exp(0.5 * logvar) * randn
+
     Args:
-        moments: Array of shape (B, 8, H, W) where first 4 channels are mean,
-                 last 4 channels are logvar
+        moments: Array of shape (B, 8, H, W) where first 4 channels are
+                 pre-scaled mean (mean * 0.18215), last 4 are logvar (unscaled)
         rng: JAX random key
         scale: VAE scale factor (default 0.18215 for SD VAE)
 
     Returns:
         x0: Sampled latent of shape (B, 4, H, W)
     """
-    # Split moments into mean and logvar
-    mean = moments[:, :4, :, :]  # (B, 4, H, W)
-    logvar = moments[:, 4:, :, :]  # (B, 4, H, W)
+    # Split moments into mean (pre-scaled) and logvar (unscaled)
+    mean_scaled = moments[:, :4, :, :]  # (B, 4, H, W) - already * 0.18215
+    logvar = moments[:, 4:, :, :]  # (B, 4, H, W) - raw logvar from VAE
 
-    # Sample from N(mean, exp(0.5 * logvar))
+    # Original: z = (mean + std * randn) * scale
+    # Equivalent: z = mean*scale + std*randn*scale
+    # Since mean_scaled = mean*scale:
+    # z = mean_scaled + scale * std * randn
     std = jnp.exp(0.5 * logvar)
-    eps = jax.random.normal(rng, mean.shape)
-    x0 = mean + eps * std
+    eps = jax.random.normal(rng, mean_scaled.shape)
+    x0 = mean_scaled + scale * std * eps
 
-    # Note: mean is already scaled during preprocessing, so we don't scale again
     return x0
 
 
