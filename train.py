@@ -8,6 +8,7 @@ import threading
 import queue
 import logging
 import zipfile
+from einops import rearrange
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -431,11 +432,15 @@ from src.metrics import (
 from src.inception_is_subprocess import InceptionISSubprocess
 
 
-def create_train_state(rng, config, learning_rate, grad_clip=1.0):
+def create_train_state(rng, config, learning_rate, grad_clip=1.0,
+                       sra2_align_layer=0, sra2_mlp_depth=5):
     """Initializes the model, optimizer, and initial EMA params.
 
     Returns (state, ema_params) where ema_params is a copy of the initial
     online params.  Caller should replicate both via jax_utils.replicate.
+
+    When sra2_align_layer > 0, the SRA2 projection head is included in the
+    model and its parameters are part of the trainable state.
     """
     model = SelfFlowDiT(
         input_size=config["input_size"],
@@ -449,6 +454,8 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        sra2_align_layer=sra2_align_layer,
+        sra2_mlp_depth=sra2_mlp_depth,
     )
 
     patch_dim = config["in_channels"] * config["patch_size"] ** 2
@@ -459,12 +466,16 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
     dummy_vec = jnp.ones((1,), dtype=jnp.int32)
 
     rng, drop_rng = jax.random.split(rng)
+    # When SRA2 is enabled, init with return_sra2_hidden=True to allocate
+    # projection head params
+    init_kwargs = dict(
+        x=dummy_x, timesteps=dummy_t, vector=dummy_vec, deterministic=False,
+    )
+    if sra2_align_layer > 0:
+        init_kwargs["return_sra2_hidden"] = True
     variables = model.init(
         {'params': rng, 'dropout': drop_rng},
-        x=dummy_x,
-        timesteps=dummy_t,
-        vector=dummy_vec,
-        deterministic=False,
+        **init_kwargs,
     )
 
     # AdamW with gradient clipping (paper specifies max_norm=1; paper-faithful)
@@ -572,6 +583,162 @@ def train_step(
     return state, ema_params, metrics, rng
 
 
+# ── SRA2 helpers ──────────────────────────────────────────────────────────────
+
+def unpatchify_tokens_to_latent(tokens):
+    """Inverse of dataloader patchify: (B, 256, 16) → (B, 4, 32, 32).
+
+    Dataloader patchify does:
+      latent (c, h//p, p, w//p, p) → transpose(1,3,2,4,0) → reshape(N, p*p*c)
+    This is: "b (h w) (p1 p2 c) -> b c (h p1) (w p2)" with h=w=16, p1=p2=2, c=4.
+    """
+    return rearrange(
+        tokens,
+        "b (h w) (p1 p2 c) -> b c (h p1) (w p2)",
+        h=16, w=16, p1=2, p2=2, c=4,
+    )
+
+
+def sra2_alignment_loss(projected_tokens, z_clean, loss_type="smooth_l1",
+                        beta=0.05):
+    """Compute SRA2 alignment loss between projected hidden and clean latent.
+
+    Args:
+        projected_tokens: (B, N, C*p^2) from SRA2 projection head
+        z_clean: (B, 4, 32, 32) clean VAE latent (alignment target)
+        loss_type: one of 'smooth_l1', 'l1', 'l2', 'cosine'
+        beta: smooth-L1 beta parameter
+
+    Returns:
+        scalar loss (mean reduction)
+    """
+    # Unpatchify projected tokens to (B, 4, 32, 32)
+    f_sit = unpatchify_tokens_to_latent(projected_tokens)
+    f_vae = z_clean
+
+    if loss_type == "smooth_l1":
+        diff = f_sit - f_vae
+        abs_diff = jnp.abs(diff)
+        loss = jnp.where(
+            abs_diff <= beta,
+            0.5 * diff ** 2 / beta,
+            abs_diff - 0.5 * beta,
+        )
+        return jnp.mean(loss)
+    elif loss_type == "l1":
+        return jnp.mean(jnp.abs(f_sit - f_vae))
+    elif loss_type == "l2":
+        return jnp.mean((f_sit - f_vae) ** 2)
+    elif loss_type == "cosine":
+        # Flatten spatial dims, compute cosine similarity per sample
+        f_sit_flat = f_sit.reshape(f_sit.shape[0], -1)
+        f_vae_flat = f_vae.reshape(f_vae.shape[0], -1)
+        cos_sim = jnp.sum(f_sit_flat * f_vae_flat, axis=-1) / (
+            jnp.linalg.norm(f_sit_flat, axis=-1) * jnp.linalg.norm(f_vae_flat, axis=-1) + 1e-8
+        )
+        return jnp.mean(1.0 - cos_sim)
+    else:
+        raise ValueError(f"Unknown SRA2 loss type: {loss_type}")
+
+
+def sra2_train_step(
+    state, ema_params, batch, z_clean, rng, ema_decay,
+    sra2_lambda, sra2_beta, sra2_tmin, sra2_tmax, sra2_loss_type,
+):
+    """SRA2 training step: L_total = L_FM + λ * L_align.
+
+    Same as vanilla train_step but additionally:
+    - Forward pass extracts hidden at alignment layer via return_sra2_hidden
+    - Computes alignment loss between projected hidden and clean latent z
+    - Applies timestep gating: only aligns when t ∈ [tmin, tmax]
+
+    Args:
+        batch: (x0, y) where x0 is patchified clean latent (B, N, D)
+        z_clean: (B, 4, 32, 32) clean VAE latent for alignment target
+    """
+    x0, y = batch
+    local_batch = x0.shape[0]
+
+    rng, tau_rng, noise_rng, drop_rng = jax.random.split(rng, 4)
+
+    tau = jax.random.uniform(tau_rng, shape=(local_batch,), minval=0.0, maxval=1.0)
+    x1 = jax.random.normal(noise_rng, x0.shape)
+
+    x_tau = (1.0 - tau[:, None, None]) * x1 + tau[:, None, None] * x0
+    target = x0 - x1
+
+    def loss_fn(params):
+        (pred, sra2_projected), mutables = state.apply_fn(
+            {"params": params},
+            x_tau,
+            timesteps=tau,
+            vector=y,
+            return_sra2_hidden=True,
+            deterministic=False,
+            rngs={"dropout": drop_rng},
+            mutable=['intermediates'],
+        )
+        # L_FM: velocity prediction loss
+        loss_fm = jnp.mean((pred - target) ** 2)
+
+        # L_align: SRA2 alignment loss with timestep gating
+        loss_align_raw = sra2_alignment_loss(
+            sra2_projected, z_clean,
+            loss_type=sra2_loss_type,
+            beta=sra2_beta,
+        )
+        # Timestep gating: zero out alignment loss for samples outside [tmin, tmax]
+        in_range = jnp.mean(
+            ((tau >= sra2_tmin) & (tau <= sra2_tmax)).astype(jnp.float32)
+        )
+        # Scale by fraction of samples in range (acts like a per-sample mask averaged over batch)
+        loss_align = loss_align_raw * in_range
+
+        loss_total = loss_fm + sra2_lambda * loss_align
+
+        v_abs_mean = jnp.mean(jnp.abs(target))
+        v_pred_abs_mean = jnp.mean(jnp.abs(pred))
+
+        block_act_mags = mutables.get('intermediates', {}).get(
+            'block_act_magnitudes', [None]
+        )
+        if isinstance(block_act_mags, tuple):
+            block_act_mags = block_act_mags[-1]
+
+        return loss_total, (loss_fm, loss_align, v_abs_mean, v_pred_abs_mean, block_act_mags)
+
+    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+    (loss_total, (loss_fm, loss_align, v_abs, v_pred, block_act_mags)), grads = grad_fn(state.params)
+
+    loss_total = jax.lax.pmean(loss_total, axis_name="batch")
+    loss_fm = jax.lax.pmean(loss_fm, axis_name="batch")
+    loss_align = jax.lax.pmean(loss_align, axis_name="batch")
+    v_abs = jax.lax.pmean(v_abs, axis_name="batch")
+    v_pred = jax.lax.pmean(v_pred, axis_name="batch")
+    grads = jax.lax.pmean(grads, axis_name="batch")
+
+    grad_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(grads)))
+    param_norm = jnp.sqrt(sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(state.params)))
+
+    state = state.apply_gradients(grads=grads)
+    ema_params = ema_update(ema_params, state.params, ema_decay)
+
+    metrics = {
+        "train/loss": loss_total,
+        "train/loss_fm": loss_fm,
+        "train/loss_align": loss_align,
+        "train/ema_decay": ema_decay,
+        "train/grad_norm": grad_norm,
+        "train/param_norm": param_norm,
+        "train/v_abs_mean": v_abs,
+        "train/v_pred_abs_mean": v_pred,
+    }
+    if block_act_mags is not None:
+        for i in range(block_act_mags.shape[0]):
+            metrics[f"training/activations/block_{i}"] = block_act_mags[i]
+    return state, ema_params, metrics, rng
+
+
 def eval_step(
     state, ema_params, batch, rng,
 ):
@@ -625,7 +792,17 @@ def get_arrayrecord_dataloader(data_pattern, batch_size, is_training=True, seed=
         def map(self, record_bytes):
             parsed = pickle.loads(record_bytes)
 
-            latent = parsed["latent"] # numpy array shape: (4, 32, 32)
+            # Support both "latent" (4,32,32) and "moments" (8,32,32) formats.
+            # "moments" stores (mean, logvar) stacked on channel dim; take mean[:4].
+            if "latent" in parsed:
+                latent = parsed["latent"]  # (4, 32, 32)
+            elif "moments" in parsed:
+                latent = parsed["moments"][:4]  # (8,32,32) → (4,32,32)
+            else:
+                raise KeyError(
+                    f"ArrayRecord missing 'latent' or 'moments' key. "
+                    f"Found keys: {list(parsed.keys())}"
+                )
             label = parsed["label"]
 
             # Patchify the latent to DiT input (256, 16)
@@ -904,7 +1081,8 @@ class AsyncWandbLogger:
         self.thread.join()
 
 
-def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0,
+                           sra2_align_layer=0, sra2_mlp_depth=5):
     """Build and JIT a sampling function with num_steps and cfg_scale baked in.
 
     XLA's scan requires a static sequence length, so num_steps cannot be a
@@ -926,6 +1104,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        sra2_align_layer=sra2_align_layer,
+        sra2_mlp_depth=sra2_mlp_depth,
     )
 
     def sample_latents(params, class_labels, rng):
@@ -1003,7 +1183,8 @@ def make_sample_latents_fn(config, num_steps=50, cfg_scale=1.0):
     return jax.jit(sample_latents)
 
 
-def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
+def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0,
+                                sra2_align_layer=0, sra2_mlp_depth=5):
     """Build a sharded (pmap) sampling function for eval.
 
     Returns a pmapped function:
@@ -1025,6 +1206,8 @@ def make_sample_latents_pmap_fn(config, num_steps=50, cfg_scale=1.0):
         learn_sigma=config["learn_sigma"],
         compatibility_mode=config["compatibility_mode"],
         per_token=False,
+        sra2_align_layer=sra2_align_layer,
+        sra2_mlp_depth=sra2_mlp_depth,
     )
 
     patch_size = config["patch_size"]
@@ -1390,6 +1573,24 @@ def main():
     parser.add_argument("--num-classes", type=int, default=None,
                         help="Override num_classes in model config. "
                              "Default: 1001 (ImageNet). For CelebAHQ256: 2.")
+    # ── SRA2 args ──────────────────────────────────────────────────────────────
+    parser.add_argument("--sra2-enable", action="store_true",
+                        help="Enable SRA2 alignment loss.")
+    parser.add_argument("--sra2-align-layer", type=int, default=2,
+                        help="Alignment layer (1-based). Paper best for SiT-B/2: 2.")
+    parser.add_argument("--sra2-lambda", type=float, default=1.0,
+                        help="Weight for alignment loss. Paper best: 1.0.")
+    parser.add_argument("--sra2-beta", type=float, default=0.05,
+                        help="Smooth-L1 beta. Paper: 0.05.")
+    parser.add_argument("--sra2-mlp-depth", type=int, default=5,
+                        help="Projection head MLP depth. Paper best: 5.")
+    parser.add_argument("--sra2-tmin", type=float, default=0.0,
+                        help="Minimum timestep for alignment (inclusive). Paper: 0.0.")
+    parser.add_argument("--sra2-tmax", type=float, default=1.0,
+                        help="Maximum timestep for alignment (inclusive). Paper: 1.0.")
+    parser.add_argument("--sra2-loss", type=str, default="smooth_l1",
+                        choices=["smooth_l1", "cosine", "l1", "l2"],
+                        help="Alignment loss type. Paper best: smooth_l1.")
     args = parser.parse_args()
 
     if args.preflight_only:
@@ -1460,6 +1661,16 @@ def main():
     log_stage(
         f"Vanilla SiT: ema_decay={args.ema_decay} grad_clip={args.grad_clip}"
     )
+    # SRA2 config
+    sra2_enabled = args.sra2_enable
+    sra2_align_layer = args.sra2_align_layer if sra2_enabled else 0
+    if sra2_enabled:
+        log_stage(
+            f"SRA2 enabled: align_layer={args.sra2_align_layer} (1-based) "
+            f"lambda={args.sra2_lambda} beta={args.sra2_beta} "
+            f"mlp_depth={args.sra2_mlp_depth} loss={args.sra2_loss} "
+            f"t_range=[{args.sra2_tmin}, {args.sra2_tmax}]"
+        )
 
     # ── WandB ─────────────────────────────────────────────────────────────────
     if not args.no_wandb:
@@ -1470,7 +1681,11 @@ def main():
 
     # ── Model, state, EMA ─────────────────────────────────────────────────────
     rng = jax.random.PRNGKey(42)
-    state, ema_params = create_train_state(rng, config, args.learning_rate, args.grad_clip)
+    state, ema_params = create_train_state(
+        rng, config, args.learning_rate, args.grad_clip,
+        sra2_align_layer=sra2_align_layer,
+        sra2_mlp_depth=args.sra2_mlp_depth,
+    )
     state = jax_utils.replicate(state)
     ema_params = jax_utils.replicate(ema_params)
     rng = jax.random.split(rng, num_devices)
@@ -1501,24 +1716,40 @@ def main():
     pmapped_train_step = jax.pmap(train_step, axis_name="batch")
     pmapped_eval_step = jax.pmap(eval_step, axis_name="batch")
 
+    # SRA2 train step (uses static args via functools.partial)
+    if sra2_enabled:
+        import functools
+        _sra2_train_step_fn = functools.partial(
+            sra2_train_step,
+            sra2_lambda=args.sra2_lambda,
+            sra2_beta=args.sra2_beta,
+            sra2_tmin=args.sra2_tmin,
+            sra2_tmax=args.sra2_tmax,
+            sra2_loss_type=args.sra2_loss,
+        )
+        pmapped_sra2_train_step = jax.pmap(_sra2_train_step_fn, axis_name="batch")
+
     # ── Sample function: num_steps and cfg_scale baked in at JIT time ─────────
     # TPU deviation: default 50 steps for fast monitoring; paper uses 250.
     # Note: CFG (cfg_scale > 1.0) requires classifier-free training which is
     #       not implemented; default is 1.0 for all eval modes.
     sample_latents_jitted = make_sample_latents_fn(
-        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale
+        config, num_steps=args.sample_num_steps, cfg_scale=args.sample_cfg_scale,
+        sra2_align_layer=sra2_align_layer, sra2_mlp_depth=args.sra2_mlp_depth,
     )
     # Separate function for FID generation (may differ in num_steps/cfg_scale)
     if args.fid_num_steps != args.sample_num_steps or args.fid_cfg_scale != args.sample_cfg_scale:
         fid_sample_latents_jitted = make_sample_latents_fn(
-            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+            config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale,
+            sra2_align_layer=sra2_align_layer, sra2_mlp_depth=args.sra2_mlp_depth,
         )
     else:
         fid_sample_latents_jitted = sample_latents_jitted
 
     # Sharded (pmap) sampler for eval hot-path (avoid single-device bottleneck)
     fid_sample_latents_pmapped = make_sample_latents_pmap_fn(
-        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale
+        config, num_steps=args.fid_num_steps, cfg_scale=args.fid_cfg_scale,
+        sra2_align_layer=sra2_align_layer, sra2_mlp_depth=args.sra2_mlp_depth,
     )
 
     # ── Data loading — fail-fast unless --mock-data is explicitly set ─────────
@@ -2213,10 +2444,19 @@ def main():
             batch_x = batch_x.reshape(num_devices, local_batch_size, n_patches, patch_dim)
             batch_y = batch_y.reshape(num_devices, local_batch_size)
 
-            # Vanilla SiT training step (returns updated EMA params)
-            state, ema_params, metrics, rng = pmapped_train_step(
-                state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
-            )
+            # Training step: SRA2 or vanilla
+            if sra2_enabled:
+                # Compute z_clean for SRA2 alignment target:
+                # batch_x is patchified (dev, local_B, 256, 16), unpatchify → (dev, local_B, 4, 32, 32)
+                z_clean = jax.vmap(unpatchify_tokens_to_latent)(batch_x)
+                state, ema_params, metrics, rng = pmapped_sra2_train_step(
+                    state, ema_params, (batch_x, batch_y), z_clean, rng, ema_decay_rep
+                )
+            else:
+                # Vanilla SiT training step (returns updated EMA params)
+                state, ema_params, metrics, rng = pmapped_train_step(
+                    state, ema_params, (batch_x, batch_y), rng, ema_decay_rep
+                )
             global_step += 1
             accumulated_train_tflops += flops_per_train_step / 1e12
 

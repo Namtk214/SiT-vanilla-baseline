@@ -229,6 +229,26 @@ class SimpleHead(nn.Module):
         return x
 
 
+class SRA2ProjectionHead(nn.Module):
+    """SRA2 projection head: maps hidden tokens → patch latent space.
+
+    Architecture: (depth-1) hidden layers with GELU + 1 linear output layer.
+    Input:  (B, N, hidden_size)
+    Output: (B, N, out_dim)  where out_dim = C * p^2 = 4 * 4 = 16
+    """
+    hidden_size: int   # model hidden dim (e.g. 768 for SiT-B)
+    out_dim: int = 16  # C * p^2 = 4 * 2^2
+    depth: int = 5     # number of MLP layers
+
+    @nn.compact
+    def __call__(self, x):
+        for i in range(self.depth - 1):
+            x = nn.Dense(self.hidden_size, name=f"fc_{i}")(x)
+            x = nn.gelu(x, approximate=True)
+        x = nn.Dense(self.out_dim, name=f"fc_out")(x)
+        return x
+
+
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -244,6 +264,9 @@ class SelfFlowDiT(nn.Module):
     per_token: bool = False
     use_remat: bool = True
     use_scan: bool = True
+    # SRA2 parameters
+    sra2_align_layer: int = 0    # 1-based layer index (0 = disabled)
+    sra2_mlp_depth: int = 5      # projection head depth
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -253,6 +276,13 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         self.feature_head = SimpleHead(in_dim=self.hidden_size, out_dim=self.hidden_size)
+        # SRA2 projection head (initialized only when sra2_align_layer > 0)
+        if self.sra2_align_layer > 0:
+            self.sra2_head = SRA2ProjectionHead(
+                hidden_size=self.hidden_size,
+                out_dim=self.in_channels * self.patch_size ** 2,  # 4*4=16
+                depth=self.sra2_mlp_depth,
+            )
 
     @nn.compact
     def __call__(
@@ -264,6 +294,7 @@ class SelfFlowDiT(nn.Module):
         return_features: bool = False,
         return_raw_features: bool = False,
         return_block_summaries: bool = False,
+        return_sra2_hidden: bool = False,
         deterministic: bool = True,
     ):
         """Forward pass with compatibility mode handling."""
@@ -316,16 +347,21 @@ class SelfFlowDiT(nn.Module):
             BlockCls = DiTBlock
 
         zs = None
+        sra2_projected = None
         block_summaries = [] if return_block_summaries else None
 
         # use_scan compiles a single block and loops over it, dramatically
         # reducing XLA compile-time HBM usage (O(1) graph instead of O(depth)).
-        # Block summaries / early feature extraction require the unrolled path.
+        # Block summaries / early feature extraction / SRA2 require the unrolled path.
+        # When SRA2 is configured, ALWAYS use unrolled path to keep param tree
+        # consistent between training (return_sra2_hidden=True) and inference.
         use_scan_now = (
             self.use_scan
             and not return_block_summaries
             and not return_features
             and not return_raw_features
+            and not return_sra2_hidden
+            and self.sra2_align_layer <= 0  # SRA2 model must always use unrolled
         )
 
         if use_scan_now:
@@ -391,6 +427,10 @@ class SelfFlowDiT(nn.Module):
                 elif (i + 1) == return_raw_features:
                     zs = x
 
+                # SRA2: extract hidden at alignment layer and project
+                if return_sra2_hidden and (i + 1) == self.sra2_align_layer:
+                    sra2_projected = self.sra2_head(x)  # (B, N, C*p^2)
+
             self.sow('intermediates', 'block_act_magnitudes',
                      jnp.stack(_unrolled_act_mags))
 
@@ -408,6 +448,10 @@ class SelfFlowDiT(nn.Module):
 
         if return_block_summaries:
             block_summaries = jnp.stack(block_summaries, axis=0)  # (depth, B, D)
+
+        # SRA2 return path: return (velocity_pred, sra2_projected)
+        if return_sra2_hidden:
+            return x, sra2_projected
 
         if return_features or return_raw_features:
             if return_block_summaries:
