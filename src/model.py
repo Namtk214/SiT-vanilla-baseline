@@ -235,6 +235,9 @@ class SRA2ProjectionHead(nn.Module):
     Architecture: (depth-1) hidden layers with GELU + 1 linear output layer.
     Input:  (B, N, hidden_size)
     Output: (B, N, out_dim)  where out_dim = C * p^2 = 4 * 4 = 16
+
+    Intermediate dim = hidden_size * 2 to match paper's ~8M param count
+    for SiT-B/2 (768 → 1536 × 4 → 16 ≈ 8.3M params).
     """
     hidden_size: int   # model hidden dim (e.g. 768 for SiT-B)
     out_dim: int = 16  # C * p^2 = 4 * 2^2
@@ -242,10 +245,16 @@ class SRA2ProjectionHead(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        for i in range(self.depth - 1):
-            x = nn.Dense(self.hidden_size, name=f"fc_{i}")(x)
+        inter_dim = self.hidden_size * 2  # e.g. 1536 for SiT-B → ~8M params
+        # First layer: hidden_size → inter_dim
+        x = nn.Dense(inter_dim, name="fc_0")(x)
+        x = nn.gelu(x, approximate=True)
+        # Middle layers: inter_dim → inter_dim
+        for i in range(1, self.depth - 1):
+            x = nn.Dense(inter_dim, name=f"fc_{i}")(x)
             x = nn.gelu(x, approximate=True)
-        x = nn.Dense(self.out_dim, name=f"fc_out")(x)
+        # Output layer: inter_dim → out_dim
+        x = nn.Dense(self.out_dim, name="fc_out")(x)
         return x
 
 

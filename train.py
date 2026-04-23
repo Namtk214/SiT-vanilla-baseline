@@ -621,8 +621,8 @@ def sra2_alignment_loss(projected_tokens, z_clean, loss_type="smooth_l1",
         abs_diff = jnp.abs(diff)
         loss = jnp.where(
             abs_diff <= beta,
-            0.5 * diff ** 2 / beta,
-            abs_diff - 0.5 * beta,
+            0.5 * diff ** 2 / beta,          # quadratic: (1/2β)Δf²
+            abs_diff / beta - 0.5,            # linear: |Δf|/β − 1/2  (paper eq. 7)
         )
         return jnp.mean(loss)
     elif loss_type == "l1":
